@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Set
 
 from minisgl.core import Batch, Req
 
@@ -35,10 +35,16 @@ class DecodeManager:
         tokens_reserved = (self.page_size - 1) * len(self.running_reqs)  # 1 page reserved
         return sum(req.remain_len for req in self.running_reqs.values()) + tokens_reserved
 
-    def schedule_next_batch(self) -> Batch | None:
+    def schedule_next_batch(self, exclude_uids: Set[int] | None = None) -> Batch | None:
         if not self.runnable:
             return None
-        reqs = [self.running_reqs[uid] for uid in sorted(self.running_reqs)]
+        if exclude_uids is None:
+            exclude_uids = set()
+        reqs = [
+            self.running_reqs[uid] for uid in sorted(self.running_reqs) if uid not in exclude_uids
+        ]
+        if len(reqs) == 0:
+            return None
         return Batch(reqs=reqs, phase="decode")
 
     @property

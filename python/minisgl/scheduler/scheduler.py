@@ -76,16 +76,13 @@ class Scheduler(SchedulerIOMixin):
             raise ValueError(f"Unknown preemption victim policy: {self.preemption_victim_policy}")
         if self.preempt_min_free_pages < 0:
             raise ValueError("preempt_min_free_pages must be non-negative")
-        if self.enable_preemption and not ENV.DISABLE_OVERLAP_SCHEDULING:
-            logger.warning_rank0(
-                "Decode preemption MVP requires overlap scheduling to be disabled. "
-                "Running the normal scheduler loop; set MINISGL_DISABLE_OVERLAP_SCHEDULING=1 "
-                "to silence this warning."
-            )
         self.num_preemptions = 0
         self.num_preempted_tokens = 0
         self.last_preempted_uids: List[int] = []
-        self.finished_reqs: Set[Req] = set()
+        self.protected_uids: Set[int] = set()
+        self.finished_uids: Set[int] = set()
+        self.released_reqs: Set[Req] = set()
+        self.pending_preempted_uids: Set[int] = set()
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         self.token_pool = self.table_manager.token_pool
@@ -114,6 +111,7 @@ class Scheduler(SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
+        self._set_protected_forward_data(last_data)
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
@@ -122,6 +120,7 @@ class Scheduler(SchedulerIOMixin):
                 ongoing_data = (forward_input, self._forward(forward_input))
 
         self._process_last_data(last_data)
+        self._set_protected_forward_data(ongoing_data)
         return ongoing_data
 
     def normal_loop(self) -> None:
@@ -129,16 +128,18 @@ class Scheduler(SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
+        self.protected_uids = set()
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
             ongoing_data = (forward_input, self._forward(forward_input))
 
         self._process_last_data(ongoing_data)
+        self.protected_uids = set()
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
-        if ENV.DISABLE_OVERLAP_SCHEDULING or self.enable_preemption:
+        if ENV.DISABLE_OVERLAP_SCHEDULING:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -159,12 +160,14 @@ class Scheduler(SchedulerIOMixin):
             return
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        processed_uids = {req.uid for req in batch.reqs}
         copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
-        new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
+                    continue
+                if req.uid in self.finished_uids:
                     continue
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
@@ -174,15 +177,14 @@ class Scheduler(SchedulerIOMixin):
                     finished |= next_token == self.eos_token_id
                 reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
 
-                # NOTE: overlap scheduling may make the request freed twice, skip second free
-                if finished and req not in self.finished_reqs:
+                if finished:
+                    self.finished_uids.add(req.uid)
                     self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
+                    self._free_req_resources_once(req)
                 elif batch.is_prefill:  # for prefill, non-chunk req, cache the prefix
                     self.cache_manager.cache_req(req, finished=False)
 
-        self.finished_reqs = new_finished_reqs
+        self.protected_uids.difference_update(processed_uids)
         self.send_result(reply)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
@@ -193,6 +195,8 @@ class Scheduler(SchedulerIOMixin):
             raise KeyboardInterrupt
         elif isinstance(msg, UserMsg):
             logger.debug_rank0("Received user msg: %s", msg)
+            self.finished_uids.discard(msg.uid)
+            self.pending_preempted_uids.discard(msg.uid)
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
             if max_output_len <= 0:
@@ -210,8 +214,10 @@ class Scheduler(SchedulerIOMixin):
             logger.debug_rank0("Aborting request %d", msg.uid)
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
+            self.finished_uids.add(msg.uid)
+            self.pending_preempted_uids.discard(msg.uid)
             if req_to_free is not None:
-                self._free_req_resources(req_to_free)
+                self._free_req_resources_once(req_to_free)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
@@ -219,6 +225,21 @@ class Scheduler(SchedulerIOMixin):
     def _free_req_resources(self, req: Req) -> None:
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
+
+    def _free_req_resources_once(self, req: Req) -> bool:
+        if req in self.released_reqs:
+            return False
+        self._free_req_resources(req)
+        self.released_reqs.add(req)
+        return True
+
+    def _forward_data_uids(self, data: ForwardData | None) -> Set[int]:
+        if data is None:
+            return set()
+        return {req.uid for req in data[0].batch.reqs}
+
+    def _set_protected_forward_data(self, data: ForwardData | None) -> None:
+        self.protected_uids = self._forward_data_uids(data)
 
     def _can_allocate_batch(self, batch: Batch) -> bool:
         margin = self.preempt_min_free_pages if self.enable_preemption and batch.is_decode else 0
@@ -262,7 +283,15 @@ class Scheduler(SchedulerIOMixin):
 
         preempted: List[Tuple[int, torch.Tensor, SamplingParams]] = []
         while len(batch.reqs) > 0 and not self._can_allocate_batch(batch):
-            victim = self._select_preemption_victim(batch.reqs)
+            candidates = [
+                req
+                for req in batch.reqs
+                if req.uid not in self.protected_uids and req.uid not in self.finished_uids
+            ]
+            if len(candidates) == 0:
+                self._finish_preempted_reqs(preempted)
+                return None
+            victim = self._select_preemption_victim(candidates)
             removed = self.decode_manager.remove_uid(victim.uid)
             assert removed is victim, f"Decode victim {victim.uid} is not running"
             remaining_tokens = victim.remain_len
@@ -272,19 +301,11 @@ class Scheduler(SchedulerIOMixin):
             preempted.append((victim.uid, input_ids, sampling_params))
             self.num_preemptions += 1
             self.num_preempted_tokens += victim.cached_len
-            self._free_req_resources(victim)
+            freed = self._free_req_resources_once(victim)
+            assert freed, f"Decode victim {victim.uid} resources were already released"
             batch.reqs = [req for req in batch.reqs if req.uid != victim.uid]
 
-        for uid, input_ids, sampling_params in reversed(preempted):
-            self.prefill_manager.add_preempted_req_front(uid, input_ids, sampling_params)
-        self.last_preempted_uids = [uid for uid, _, _ in preempted]
-        if self.last_preempted_uids:
-            logger.info_rank0(
-                "Preempted decode requests: uids=%s, policy=%s, total_preemptions=%d",
-                self.last_preempted_uids,
-                self.preemption_victim_policy,
-                self.num_preemptions,
-            )
+        self._finish_preempted_reqs(preempted)
 
         if len(batch.reqs) == 0:
             return None
@@ -297,6 +318,22 @@ class Scheduler(SchedulerIOMixin):
                 f" margin_pages={self.preempt_min_free_pages}"
             )
         return batch
+
+    def _finish_preempted_reqs(
+        self, preempted: List[Tuple[int, torch.Tensor, SamplingParams]]
+    ) -> None:
+        for uid, input_ids, sampling_params in reversed(preempted):
+            assert uid not in self.pending_preempted_uids, f"Request {uid} is already pending"
+            self.prefill_manager.add_preempted_req_front(uid, input_ids, sampling_params)
+            self.pending_preempted_uids.add(uid)
+        self.last_preempted_uids = [uid for uid, _, _ in preempted]
+        if self.last_preempted_uids:
+            logger.info_rank0(
+                "Preempted decode requests: uids=%s, policy=%s, total_preemptions=%d",
+                self.last_preempted_uids,
+                self.preemption_victim_policy,
+                self.num_preemptions,
+            )
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
@@ -316,7 +353,7 @@ class Scheduler(SchedulerIOMixin):
     def _schedule_next_batch(self) -> ForwardInput | None:
         if self.decode_first:
             batch = (
-                self.decode_manager.schedule_next_batch()
+                self._schedule_decode_batch()
                 or self.prefill_manager.schedule_next_batch(
                     self.prefill_budget, self.dynamic_kv_allocation
                 )
@@ -324,10 +361,15 @@ class Scheduler(SchedulerIOMixin):
         else:
             batch = self.prefill_manager.schedule_next_batch(
                 self.prefill_budget, self.dynamic_kv_allocation
-            ) or self.decode_manager.schedule_next_batch()
+            ) or self._schedule_decode_batch()
         if batch is not None:
             batch = self._maybe_preempt_to_fit(batch)
         return self._prepare_batch(batch) if batch else None
+
+    def _schedule_decode_batch(self) -> Batch | None:
+        if self.enable_preemption:
+            return self.decode_manager.schedule_next_batch(self.protected_uids)
+        return self.decode_manager.schedule_next_batch()
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
@@ -335,6 +377,9 @@ class Scheduler(SchedulerIOMixin):
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        for req in forward_input.batch.reqs:
+            if req.can_decode:
+                self.pending_preempted_uids.discard(req.uid)
         return forward_output
 
 

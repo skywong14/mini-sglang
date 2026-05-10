@@ -56,6 +56,16 @@ def test_decode_manager_order_is_not_insertion_dependent():
     assert not isinstance(first.running_reqs, set)
 
 
+def test_decode_manager_can_exclude_protected_uids():
+    manager = DecodeManager(page_size=4)
+    manager.filter_reqs([_make_req(3), _make_req(1), _make_req(2)])
+
+    batch = manager.schedule_next_batch(exclude_uids={1, 3})
+
+    assert batch is not None
+    assert [req.uid for req in batch.reqs] == [2]
+
+
 def test_decode_manager_abort_is_uid_keyed():
     manager = DecodeManager(page_size=4)
     reqs = [_make_req(1), _make_req(2), _make_req(3)]
