@@ -4,7 +4,8 @@ from __future__ import annotations
 Manual run:
   eval "$(conda shell.bash hook)" && conda activate minisgl
   PYTHONPATH=python python tests/manual/preemption_greedy_correctness.py \
-    --model-path Qwen/Qwen3-0.6B
+    --model-path Qwen/Qwen3-0.6B \
+    --enable-overlap-preemption
 """
 
 import argparse
@@ -31,7 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--max-extend-tokens", type=int, default=256)
     parser.add_argument("--preempt-min-free-pages", type=int, default=1)
-    parser.add_argument("--allow-zero-preemptions", action="store_true")
+    parser.add_argument(
+        "--enable-overlap-preemption",
+        action="store_true",
+        help="Run the preempt case with experimental overlap-safe preemption enabled.",
+    )
     parser.add_argument("--worker-case", choices=["baseline", "preempt"])
     parser.add_argument("--output-json")
     return parser.parse_args()
@@ -60,7 +65,11 @@ def make_prompts(num_prompts: int, repeat: int) -> list[str]:
 def run_worker(args: argparse.Namespace) -> None:
     assert args.worker_case is not None
     assert args.output_json is not None
-    os.environ["MINISGL_DISABLE_OVERLAP_SCHEDULING"] = "1"
+    if args.worker_case == "preempt":
+        assert args.enable_overlap_preemption, (
+            "Preempt worker must run with --enable-overlap-preemption"
+        )
+    os.environ["MINISGL_DISABLE_OVERLAP_SCHEDULING"] = "0"
 
     from minisgl.core import SamplingParams
     from minisgl.llm import LLM
@@ -77,6 +86,7 @@ def run_worker(args: argparse.Namespace) -> None:
         max_extend_tokens=args.max_extend_tokens,
         cuda_graph_max_bs=0,
         enable_preemption=enable_preemption,
+        enable_overlap_preemption=enable_preemption and args.enable_overlap_preemption,
         dynamic_kv_allocation=enable_preemption,
         decode_first=enable_preemption,
         preempt_min_free_pages=args.preempt_min_free_pages,
@@ -84,11 +94,20 @@ def run_worker(args: argparse.Namespace) -> None:
     try:
         results = llm.generate(
             make_prompts(args.num_prompts, args.prompt_repeat),
-            SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=args.max_tokens),
+            SamplingParams(
+                temperature=0.0,
+                top_k=1,
+                top_p=1.0,
+                ignore_eos=True,
+                max_tokens=args.max_tokens,
+            ),
         )
         payload = {
             "case": args.worker_case,
             "num_preemptions": llm.num_preemptions,
+            "num_deferred_preemptions": llm.num_deferred_preemptions,
+            "num_resumed_preempted_reqs": llm.num_resumed_preempted_reqs,
+            "output_lengths": [len(result["token_ids"]) for result in results],
             "token_ids": [result["token_ids"] for result in results],
         }
         pathlib.Path(args.output_json).write_text(json.dumps(payload), encoding="utf-8")
@@ -99,7 +118,7 @@ def run_worker(args: argparse.Namespace) -> None:
 def run_case(case: str, args: argparse.Namespace, output_json: pathlib.Path) -> dict:
     repo_root = pathlib.Path(__file__).resolve().parents[2]
     env = os.environ.copy()
-    env["MINISGL_DISABLE_OVERLAP_SCHEDULING"] = "1"
+    env["MINISGL_DISABLE_OVERLAP_SCHEDULING"] = "0"
     python_path = str(repo_root / "python")
     env["PYTHONPATH"] = (
         python_path if "PYTHONPATH" not in env else f"{python_path}:{env['PYTHONPATH']}"
@@ -134,6 +153,8 @@ def run_case(case: str, args: argparse.Namespace, output_json: pathlib.Path) -> 
         "--preempt-min-free-pages",
         str(args.preempt_min_free_pages),
     ]
+    if args.enable_overlap_preemption:
+        cmd.append("--enable-overlap-preemption")
     subprocess.run(cmd, env=env, check=True)
     return json.loads(output_json.read_text(encoding="utf-8"))
 
@@ -143,14 +164,18 @@ def main() -> None:
     if args.worker_case is not None:
         run_worker(args)
         return
+    assert args.enable_overlap_preemption, (
+        "Pass --enable-overlap-preemption to validate overlap-safe preemption"
+    )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = pathlib.Path(tmpdir)
         baseline = run_case("baseline", args, tmp / "baseline.json")
         preempt = run_case("preempt", args, tmp / "preempt.json")
 
-    if not args.allow_zero_preemptions:
-        assert preempt["num_preemptions"] > 0, "Expected preempt run to preempt at least once"
+    assert preempt["num_preemptions"] > 0, "Expected preempt run to preempt at least once"
+    if preempt["num_deferred_preemptions"] != 0:
+        assert preempt["num_deferred_preemptions"] > 0
     assert baseline["token_ids"] == preempt["token_ids"], (
         "Greedy token ids differ between baseline and preemption runs"
     )
@@ -158,7 +183,13 @@ def main() -> None:
         json.dumps(
             {
                 "baseline_num_preemptions": baseline["num_preemptions"],
+                "baseline_output_lengths": baseline["output_lengths"],
+                "preempt_num_deferred_preemptions": preempt["num_deferred_preemptions"],
                 "preempt_num_preemptions": preempt["num_preemptions"],
+                "preempt_num_resumed_preempted_reqs": preempt[
+                    "num_resumed_preempted_reqs"
+                ],
+                "preempt_output_lengths": preempt["output_lengths"],
                 "num_prompts": len(baseline["token_ids"]),
                 "tokens_per_prompt": [len(ids) for ids in baseline["token_ids"]],
             },

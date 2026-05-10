@@ -3,7 +3,9 @@ from __future__ import annotations
 """
 Manual run:
   eval "$(conda shell.bash hook)" && conda activate minisgl
-  PYTHONPATH=python python tests/manual/preemption_smoke.py --model-path Qwen/Qwen3-0.6B
+  PYTHONPATH=python python tests/manual/preemption_smoke.py \
+    --model-path Qwen/Qwen3-0.6B \
+    --enable-overlap-preemption
 """
 
 import argparse
@@ -23,6 +25,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=96)
     parser.add_argument("--max-extend-tokens", type=int, default=256)
     parser.add_argument("--preempt-min-free-pages", type=int, default=1)
+    parser.add_argument(
+        "--enable-overlap-preemption",
+        action="store_true",
+        help="Run with overlap scheduling and experimental overlap-safe preemption.",
+    )
     return parser.parse_args()
 
 
@@ -37,8 +44,10 @@ def dtype_from_name(name: str):
 
 
 def main() -> None:
-    os.environ["MINISGL_DISABLE_OVERLAP_SCHEDULING"] = "1"
     args = parse_args()
+    os.environ["MINISGL_DISABLE_OVERLAP_SCHEDULING"] = (
+        "0" if args.enable_overlap_preemption else "1"
+    )
 
     from minisgl.core import SamplingParams
     from minisgl.llm import LLM
@@ -60,6 +69,7 @@ def main() -> None:
         max_extend_tokens=args.max_extend_tokens,
         cuda_graph_max_bs=0,
         enable_preemption=True,
+        enable_overlap_preemption=args.enable_overlap_preemption,
         dynamic_kv_allocation=True,
         decode_first=True,
         preempt_min_free_pages=args.preempt_min_free_pages,
@@ -67,11 +77,20 @@ def main() -> None:
     try:
         results = llm.generate(
             prompts,
-            SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=args.max_tokens),
+            SamplingParams(
+                temperature=0.0,
+                top_k=1,
+                top_p=1.0,
+                ignore_eos=True,
+                max_tokens=args.max_tokens,
+            ),
         )
         assert llm.num_preemptions > 0, "Expected at least one decode preemption"
         payload = {
+            "enable_overlap_preemption": args.enable_overlap_preemption,
+            "num_deferred_preemptions": llm.num_deferred_preemptions,
             "num_preemptions": llm.num_preemptions,
+            "num_resumed_preempted_reqs": llm.num_resumed_preempted_reqs,
             "last_preempted_uids": llm.last_preempted_uids,
             "output_lengths": [len(result["token_ids"]) for result in results],
         }

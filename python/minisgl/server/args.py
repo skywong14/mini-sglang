@@ -220,6 +220,13 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         ),
     )
 
+    assert ServerArgs.enable_overlap_preemption == False
+    parser.add_argument(
+        "--enable-overlap-preemption",
+        action="store_true",
+        help="Allow experimental decode preemption under overlap scheduling.",
+    )
+
     assert ServerArgs.dynamic_kv_allocation == False
     parser.add_argument(
         "--dynamic-kv-allocation",

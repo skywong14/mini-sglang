@@ -17,6 +17,7 @@ class SchedulerConfig(EngineConfig):
     cache_type: str = "radix"
     offline_mode: bool = False
     enable_preemption: bool = False
+    enable_overlap_preemption: bool = False
     dynamic_kv_allocation: bool = False
     decode_first: bool = False
     preemption_victim_policy: str = "largest_kv"
