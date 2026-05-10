@@ -33,6 +33,25 @@ class CacheManager:
     def available_size(self) -> int:
         return self.prefix_cache.size_info.evictable_size + len(self.free_slots) * self.page_size
 
+    @property
+    def evictable_pages(self) -> int:
+        return self.prefix_cache.size_info.evictable_size // self.page_size
+
+    @property
+    def allocatable_pages(self) -> int:
+        return len(self.free_slots) + self.evictable_pages
+
+    def needed_pages_for_reqs(self, reqs: List[Req]) -> int:
+        needed_pages = 0
+        for req in reqs:
+            first_page = div_ceil(req.cached_len, self.page_size)
+            last_page = div_ceil(req.device_len, self.page_size)
+            needed_pages += max(last_page - first_page, 0)
+        return needed_pages
+
+    def can_allocate_reqs(self, reqs: List[Req]) -> bool:
+        return self.needed_pages_for_reqs(reqs) <= self.allocatable_pages
+
     def lock(self, handle: BaseCacheHandle) -> None:
         self.prefix_cache.lock_handle(handle, unlock=False)
 
@@ -40,13 +59,12 @@ class CacheManager:
         self.prefix_cache.lock_handle(handle, unlock=True)
 
     def allocate_paged(self, reqs: List[Req]) -> None:
-        needed_pages = 0
+        needed_pages = self.needed_pages_for_reqs(reqs)
         allocation_info: List[Tuple[int, int, int]] = []
         for req in reqs:
             first_page = div_ceil(req.cached_len, self.page_size)
             last_page = div_ceil(req.device_len, self.page_size)
             if last_page > first_page:
-                needed_pages += last_page - first_page
                 allocation_info.append((req.table_idx, first_page, last_page))
         if needed_pages > 0:
             allocated = self._page_to_token(self._allocate(needed_pages))

@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
 import torch
-from minisgl.core import Batch, Req
-from minisgl.utils import init_logger
+from minisgl.core import Batch, Req, SamplingParams
+from minisgl.utils import div_ceil, init_logger
 
 from .utils import PendingReq
 
@@ -35,6 +35,16 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    dynamic_kv_allocation: bool = False
+
+    def _estimate_one(self, cached_len: int, input_len: int, output_len: int) -> int:
+        if not self.dynamic_kv_allocation:
+            return input_len - cached_len + output_len
+
+        chunk_size = min(self.token_budget, input_len - cached_len)
+        first_page = div_ceil(cached_len, self.cache_manager.page_size)
+        last_page = div_ceil(cached_len + chunk_size, self.cache_manager.page_size)
+        return max(last_page - first_page, 0) * self.cache_manager.page_size
 
     def _try_allocate_one(self, req: PendingReq) -> Tuple[BaseCacheHandle, int] | None:
         if self.table_manager.available_size == 0:
@@ -43,9 +53,7 @@ class PrefillAdder:
         # TODO: consider host cache match case
         handle = self.cache_manager.match_req(req).cuda_handle
         cached_len = handle.cached_len
-        # TODO: better estimate policy
-        extend_len = req.input_len - cached_len
-        estimated_len = extend_len + req.output_len
+        estimated_len = self._estimate_one(cached_len, req.input_len, req.output_len)
 
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
             return None
@@ -74,7 +82,12 @@ class PrefillAdder:
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
-        self.reserved_size += remain_len + pending_req.output_len
+        if self.dynamic_kv_allocation:
+            first_page = div_ceil(cached_len, self.cache_manager.page_size)
+            last_page = div_ceil(cached_len + chunk_size, self.cache_manager.page_size)
+            self.reserved_size += max(last_page - first_page, 0) * self.cache_manager.page_size
+        else:
+            self.reserved_size += remain_len + pending_req.output_len
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
@@ -94,6 +107,12 @@ class PrefillAdder:
             return None
 
         if chunked_req := pending_req.chunked_req:
+            if self.dynamic_kv_allocation:
+                estimated_len = self._estimate_one(
+                    chunked_req.cached_len, pending_req.input_len, pending_req.output_len
+                )
+                if estimated_len + self.reserved_size > self.cache_manager.available_size:
+                    return None
             return self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=chunked_req.cache_handle,
@@ -123,16 +142,27 @@ class PrefillManager:
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
 
-    def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
+    def add_preempted_req_front(
+        self, uid: int, input_ids: torch.Tensor, sampling_params: SamplingParams
+    ) -> None:
+        assert input_ids.is_cpu, "Preempted request input_ids must be on CPU"
+        pending_req = PendingReq(uid, input_ids.clone(), sampling_params)
+        self.pending_list.insert(0, pending_req)
+
+    def schedule_next_batch(
+        self, prefill_budget: int, dynamic_kv_allocation: bool = False
+    ) -> Batch | None:
         if len(self.pending_list) == 0:
             return None
 
         # estimated offset due to in-flight decode
+        reserved_size = 0 if dynamic_kv_allocation else self.decode_manager.inflight_tokens
         adder = PrefillAdder(
             token_budget=prefill_budget,
-            reserved_size=self.decode_manager.inflight_tokens,
+            reserved_size=reserved_size,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            dynamic_kv_allocation=dynamic_kv_allocation,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []

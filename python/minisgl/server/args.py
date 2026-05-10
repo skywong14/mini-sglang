@@ -210,6 +210,48 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="The KV cache management strategy.",
     )
 
+    assert ServerArgs.enable_preemption == False
+    parser.add_argument(
+        "--enable-preemption",
+        action="store_true",
+        help=(
+            "Enable recompute-based decode preemption. This also enables dynamic KV "
+            "allocation and decode-first scheduling."
+        ),
+    )
+
+    assert ServerArgs.dynamic_kv_allocation == False
+    parser.add_argument(
+        "--dynamic-kv-allocation",
+        action="store_true",
+        help="Allocate KV pages dynamically without reserving max_tokens for future decode steps.",
+    )
+
+    assert ServerArgs.decode_first == False
+    parser.add_argument(
+        "--decode-first",
+        action="store_true",
+        help="Schedule decode batches before prefill batches.",
+    )
+
+    parser.add_argument(
+        "--preemption-victim-policy",
+        type=str,
+        default=ServerArgs.preemption_victim_policy,
+        choices=["largest_kv", "fcfs_tail"],
+        help="Victim selection policy for decode preemption.",
+    )
+
+    parser.add_argument(
+        "--preempt-min-free-pages",
+        type=int,
+        default=ServerArgs.preempt_min_free_pages,
+        help=(
+            "Minimum extra allocatable pages to keep after fitting a decode batch when "
+            "preemption is enabled."
+        ),
+    )
+
     parser.add_argument(
         "--moe-backend",
         default=ServerArgs.moe_backend,

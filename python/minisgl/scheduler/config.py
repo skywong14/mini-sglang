@@ -16,6 +16,11 @@ class SchedulerConfig(EngineConfig):
     max_extend_tokens: int = 8192
     cache_type: str = "radix"
     offline_mode: bool = False
+    enable_preemption: bool = False
+    dynamic_kv_allocation: bool = False
+    decode_first: bool = False
+    preemption_victim_policy: str = "largest_kv"
+    preempt_min_free_pages: int = 1
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)

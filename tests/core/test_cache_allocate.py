@@ -4,11 +4,21 @@ Test that CacheManager._allocate correctly handles eviction with page_size > 1.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import pytest
 import torch
 
 import minisgl.core as core
+from minisgl.core import Req, SamplingParams
+from minisgl.kvcache import BaseCacheHandle
 from minisgl.scheduler.cache import CacheManager
+
+
+@dataclass(frozen=True)
+class DummyHandle(BaseCacheHandle):
+    def get_matched_indices(self) -> torch.Tensor:
+        return torch.arange(self.cached_len, dtype=torch.int32)
 
 
 @pytest.fixture(autouse=True)
@@ -31,6 +41,18 @@ def _make_cache_manager(num_pages: int, page_size: int) -> CacheManager:
 def _insert_evictable(cm: CacheManager, input_ids: torch.Tensor, indices: torch.Tensor):
     """Insert a prefix into the radix cache so it becomes evictable."""
     cm.prefix_cache.insert_prefix(input_ids, indices)
+
+
+def _make_req(cached_len: int, device_len: int, uid: int = 0) -> Req:
+    return Req(
+        input_ids=torch.arange(device_len, dtype=torch.int32),
+        table_idx=uid,
+        cached_len=cached_len,
+        output_len=1,
+        uid=uid,
+        sampling_params=SamplingParams(max_tokens=1),
+        cache_handle=DummyHandle(cached_len),
+    )
 
 
 def _assert_all_page_aligned(tensor: torch.Tensor, page_size: int, label: str = ""):
@@ -197,6 +219,56 @@ class TestAllocateEvictPageAlignment:
         allocated = cm._allocate(1)
         _assert_all_page_aligned(allocated, page_size, "allocated after evict")
         _assert_all_page_aligned(cm.free_slots, page_size, "_free_slots after evict")
+
+
+class TestCacheManagerPageAccounting:
+    def test_needed_pages_for_reqs_page_size_one(self):
+        cm = _make_cache_manager(num_pages=8, page_size=1)
+        reqs = [_make_req(cached_len=1, device_len=4), _make_req(cached_len=2, device_len=3)]
+
+        assert cm.needed_pages_for_reqs(reqs) == 4
+
+    def test_needed_pages_for_reqs_page_size_greater_than_one(self):
+        cm = _make_cache_manager(num_pages=8, page_size=4)
+        reqs = [
+            _make_req(cached_len=1, device_len=2),
+            _make_req(cached_len=4, device_len=5),
+            _make_req(cached_len=8, device_len=13),
+        ]
+
+        assert cm.needed_pages_for_reqs(reqs) == 3
+
+    @pytest.mark.parametrize(
+        ("cached_len", "device_len", "expected"),
+        [
+            (0, 1, 1),
+            (0, 4, 1),
+            (0, 5, 2),
+            (3, 4, 0),
+            (4, 5, 1),
+            (7, 8, 0),
+            (8, 9, 1),
+            (1, 8, 1),
+        ],
+    )
+    def test_needed_pages_for_reqs_page_boundaries(self, cached_len, device_len, expected):
+        cm = _make_cache_manager(num_pages=8, page_size=4)
+
+        assert cm.needed_pages_for_reqs([_make_req(cached_len, device_len)]) == expected
+
+    def test_allocatable_pages_includes_evictable_pages(self):
+        page_size = 4
+        cm = _make_cache_manager(num_pages=2, page_size=page_size)
+        cm._allocate(2)
+        assert cm.allocatable_pages == 0
+
+        input_ids = torch.arange(page_size * 2, dtype=torch.int32)
+        indices = torch.arange(page_size * 2, dtype=torch.int32)
+        _insert_evictable(cm, input_ids, indices)
+
+        assert cm.evictable_pages == 2
+        assert cm.allocatable_pages == 2
+        assert cm.can_allocate_reqs([_make_req(cached_len=0, device_len=8)])
 
 
 if __name__ == "__main__":
