@@ -9,6 +9,7 @@ import torch
 import minisgl.scheduler.scheduler as scheduler_module
 from minisgl.core import Batch, Req, SamplingParams
 from minisgl.kvcache import BaseCacheHandle
+from minisgl.message import AbortBackendMsg
 from minisgl.scheduler.decode import DecodeManager
 from minisgl.scheduler.prefill import PrefillAdder, PrefillManager
 from minisgl.scheduler.scheduler import ForwardInput, Scheduler
@@ -57,6 +58,7 @@ class FakeTableManager:
 @pytest.fixture(autouse=True)
 def disable_rank0_logs(monkeypatch):
     monkeypatch.setattr(scheduler_module.logger, "info_rank0", lambda *args, **kwargs: None)
+    monkeypatch.setattr(scheduler_module.logger, "debug_rank0", lambda *args, **kwargs: None)
 
 
 def _make_decode_req(uid: int, cached_len: int, output_len: int = 8) -> Req:
@@ -85,10 +87,11 @@ def _make_scheduler(policy: str, allocatable_pages: int = 1, margin: int = 0):
     scheduler.preemption_victim_policy = policy
     scheduler.preempt_min_free_pages = margin
     scheduler.num_preemptions = 0
-    scheduler.num_preempted_tokens = 0
+    scheduler.num_preempted_prefix_tokens = 0
     scheduler.last_preempted_uids = []
     scheduler.protected_uids = set()
     scheduler.finished_uids = set()
+    scheduler.aborted_uids = set()
     scheduler.released_reqs = set()
     scheduler.pending_preempted_uids = set()
     scheduler.sent_replies = []
@@ -155,7 +158,7 @@ def test_preemption_requeues_with_remaining_budget_and_removes_decode_req():
     assert sorted(scheduler.decode_manager.running_reqs) == [3]
     assert scheduler.last_preempted_uids == [1, 2]
     assert scheduler.num_preemptions == 2
-    assert scheduler.num_preempted_tokens == reqs[0].cached_len + reqs[2].cached_len
+    assert scheduler.num_preempted_prefix_tokens == reqs[0].cached_len + reqs[2].cached_len
     assert scheduler.table_manager.freed_slots == [1, 2]
     assert scheduler.cache_manager.cached_finished == [(1, True), (2, True)]
 
@@ -257,6 +260,46 @@ def test_finished_request_is_released_once_for_stale_overlap_data():
     assert scheduler.sent_replies[1] == []
 
 
+def test_abort_protected_request_defers_free_until_last_data_processed():
+    scheduler = _make_scheduler("largest_kv", allocatable_pages=0)
+    req = _make_decode_req(uid=1, cached_len=4)
+    req.complete_one()
+    original_input_ids = req.input_ids.clone()
+    scheduler.decode_manager.filter_reqs([req])
+    batch = Batch(reqs=[req], phase="decode")
+    data = _make_forward_data(batch, [10])
+    scheduler._set_protected_forward_data(data)
+
+    scheduler._process_one_msg(AbortBackendMsg(uid=req.uid))
+
+    assert scheduler.aborted_uids == {1}
+    assert scheduler.decode_manager.running_reqs == {}
+    assert scheduler.table_manager.freed_slots == []
+    assert scheduler.cache_manager.cached_finished == []
+
+    scheduler._process_last_data(data)
+
+    assert scheduler.table_manager.freed_slots == [1]
+    assert scheduler.cache_manager.cached_finished == [(1, True)]
+    assert scheduler.sent_replies == [[]]
+    assert torch.equal(req.input_ids, original_input_ids)
+
+
+def test_aborted_request_is_not_selected_as_preemption_victim():
+    scheduler = _make_scheduler("largest_kv", allocatable_pages=1)
+    aborted = _make_decode_req(uid=1, cached_len=32)
+    victim = _make_decode_req(uid=2, cached_len=4)
+    scheduler.decode_manager.filter_reqs([aborted, victim])
+    scheduler.aborted_uids = {aborted.uid}
+    batch = Batch(reqs=[aborted, victim], phase="decode")
+
+    new_batch = scheduler._maybe_preempt_to_fit(batch)
+
+    assert new_batch is not None
+    assert [req.uid for req in new_batch.reqs] == [1]
+    assert scheduler.last_preempted_uids == [2]
+
+
 def test_preempted_request_is_requeued_once_when_protected_batch_cannot_fit():
     scheduler = _make_scheduler("fcfs_tail", allocatable_pages=0)
     protected = _make_decode_req(uid=1, cached_len=4)
@@ -294,6 +337,71 @@ def test_decode_scheduling_excludes_protected_uids_when_preemption_is_enabled():
 
     assert scheduled is not None
     assert [req.uid for req in scheduled.reqs] == [2]
+
+
+def test_decode_first_resumes_preempted_request_before_more_decode():
+    prefill_batch = Batch(reqs=[_make_decode_req(uid=1, cached_len=4)], phase="prefill")
+    decode_batch = Batch(reqs=[_make_decode_req(uid=2, cached_len=4)], phase="decode")
+
+    class ResumePrefillManager:
+        runnable = True
+
+        def __init__(self):
+            self.calls = 0
+
+        def schedule_next_batch(self, prefill_budget, dynamic_kv_allocation=False):
+            self.calls += 1
+            return prefill_batch
+
+    class RecordingDecodeManager:
+        def __init__(self):
+            self.calls = 0
+
+        def schedule_next_batch(self, exclude_uids=None):
+            self.calls += 1
+            return decode_batch
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.enable_preemption = True
+    scheduler.decode_first = True
+    scheduler.dynamic_kv_allocation = True
+    scheduler.prefill_budget = 123
+    scheduler.pending_preempted_uids = {1}
+    scheduler.protected_uids = set()
+    scheduler.prefill_manager = ResumePrefillManager()
+    scheduler.decode_manager = RecordingDecodeManager()
+    scheduler._maybe_preempt_to_fit = lambda batch: batch
+    scheduler._prepare_batch = lambda batch: batch
+
+    scheduled = scheduler._schedule_next_batch()
+
+    assert scheduled is prefill_batch
+    assert scheduler.prefill_manager.calls == 1
+    assert scheduler.decode_manager.calls == 0
+
+
+def test_preemption_run_forever_uses_normal_loop_even_when_overlap_env_is_enabled():
+    class StopLoop(Exception):
+        pass
+
+    class DummyStream:
+        def wait_stream(self, stream):
+            pass
+
+    @contextmanager
+    def dummy_stream_context():
+        yield
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.enable_preemption = True
+    scheduler.engine_stream_ctx = dummy_stream_context()
+    scheduler.engine = SimpleNamespace(stream=DummyStream())
+    scheduler.stream = object()
+    scheduler.normal_loop = lambda: (_ for _ in ()).throw(StopLoop())
+    scheduler.overlap_loop = lambda data: pytest.fail("preemption should not use overlap_loop")
+
+    with pytest.raises(StopLoop):
+        scheduler.run_forever()
 
 
 def test_no_preemption_mode_keeps_prefill_first_scheduling():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import weakref
 from dataclasses import replace
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
@@ -77,11 +78,12 @@ class Scheduler(SchedulerIOMixin):
         if self.preempt_min_free_pages < 0:
             raise ValueError("preempt_min_free_pages must be non-negative")
         self.num_preemptions = 0
-        self.num_preempted_tokens = 0
+        self.num_preempted_prefix_tokens = 0
         self.last_preempted_uids: List[int] = []
         self.protected_uids: Set[int] = set()
         self.finished_uids: Set[int] = set()
-        self.released_reqs: Set[Req] = set()
+        self.aborted_uids: Set[int] = set()
+        self.released_reqs = weakref.WeakSet()
         self.pending_preempted_uids: Set[int] = set()
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
@@ -103,6 +105,7 @@ class Scheduler(SchedulerIOMixin):
         It will overlap the execution of current batch and processing of last batch's results,
         which can effectively hide CPU latency and improve GPU utilization.
         """
+        self._set_protected_forward_data(last_data)
         blocking = not (
             last_data is not None  # don't block if we have a batch to be processed
             or self.prefill_manager.runnable
@@ -111,7 +114,6 @@ class Scheduler(SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
-        self._set_protected_forward_data(last_data)
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
@@ -139,7 +141,7 @@ class Scheduler(SchedulerIOMixin):
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
+        if ENV.DISABLE_OVERLAP_SCHEDULING or self.enable_preemption:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -166,6 +168,10 @@ class Scheduler(SchedulerIOMixin):
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
+                    continue
+                if req.uid in self.aborted_uids:
+                    self.decode_manager.remove_req(req)
+                    self._free_req_resources_once(req)
                     continue
                 if req.uid in self.finished_uids:
                     continue
@@ -196,6 +202,7 @@ class Scheduler(SchedulerIOMixin):
         elif isinstance(msg, UserMsg):
             logger.debug_rank0("Received user msg: %s", msg)
             self.finished_uids.discard(msg.uid)
+            self.aborted_uids.discard(msg.uid)
             self.pending_preempted_uids.discard(msg.uid)
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
@@ -212,10 +219,13 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
-            req_to_free = self.prefill_manager.abort_req(msg.uid)
-            req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
-            self.finished_uids.add(msg.uid)
+            self.aborted_uids.add(msg.uid)
             self.pending_preempted_uids.discard(msg.uid)
+            req_to_free = self.prefill_manager.abort_req(msg.uid)
+            if msg.uid in self.protected_uids:
+                self.decode_manager.remove_uid(msg.uid)
+            else:
+                req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if req_to_free is not None:
                 self._free_req_resources_once(req_to_free)
         else:
@@ -286,7 +296,11 @@ class Scheduler(SchedulerIOMixin):
             candidates = [
                 req
                 for req in batch.reqs
-                if req.uid not in self.protected_uids and req.uid not in self.finished_uids
+                if (
+                    req.uid not in self.protected_uids
+                    and req.uid not in self.finished_uids
+                    and req.uid not in self.aborted_uids
+                )
             ]
             if len(candidates) == 0:
                 self._finish_preempted_reqs(preempted)
@@ -300,7 +314,7 @@ class Scheduler(SchedulerIOMixin):
             input_ids = victim.input_ids.clone()
             preempted.append((victim.uid, input_ids, sampling_params))
             self.num_preemptions += 1
-            self.num_preempted_tokens += victim.cached_len
+            self.num_preempted_prefix_tokens += victim.cached_len
             freed = self._free_req_resources_once(victim)
             assert freed, f"Decode victim {victim.uid} resources were already released"
             batch.reqs = [req for req in batch.reqs if req.uid != victim.uid]
@@ -351,7 +365,11 @@ class Scheduler(SchedulerIOMixin):
         )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        if self.decode_first:
+        if self.decode_first and self.pending_preempted_uids and self.prefill_manager.runnable:
+            batch = self.prefill_manager.schedule_next_batch(
+                self.prefill_budget, self.dynamic_kv_allocation
+            ) or self._schedule_decode_batch()
+        elif self.decode_first:
             batch = (
                 self._schedule_decode_batch()
                 or self.prefill_manager.schedule_next_batch(
