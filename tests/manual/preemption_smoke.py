@@ -91,6 +91,7 @@ def main() -> None:
             "num_deferred_preemptions": llm.num_deferred_preemptions,
             "num_preemptions": llm.num_preemptions,
             "num_preemption_stalls": llm.num_preemption_stalls,
+            "num_prefill_fit_failures": llm.num_prefill_fit_failures,
             "num_resumed_preempted_reqs": llm.num_resumed_preempted_reqs,
             "last_preempted_uids": llm.last_preempted_uids,
             "output_lengths": [len(result["token_ids"]) for result in results],

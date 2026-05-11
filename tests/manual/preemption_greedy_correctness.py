@@ -19,7 +19,13 @@ import tempfile
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare greedy outputs with and without preemption."
+        description="Compare greedy outputs with and without preemption.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Recommended deferred-path pressure:
+  --baseline-num-pages 4096 --preempt-num-pages 256 --num-prompts 6
+  --prompt-repeat 28 --max-running-req 6 --max-tokens 96
+  --max-extend-tokens 256 --require-deferred-preemption
+""",
     )
     parser.add_argument("--model-path", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"])
@@ -58,13 +64,11 @@ def dtype_from_name(name: str):
 
 
 def make_prompts(num_prompts: int, repeat: int) -> list[str]:
-    return [
-        (
-            f"Prompt {idx}: give a concise technical summary of recompute preemption. "
-            * repeat
-        )
-        for idx in range(num_prompts)
-    ]
+    prompt = (
+        "Continue this exact repeated-word pattern without explanation:\n"
+        + ("preemption " * repeat)
+    )
+    return [prompt for _ in range(num_prompts)]
 
 
 def run_worker(args: argparse.Namespace) -> None:
@@ -92,8 +96,8 @@ def run_worker(args: argparse.Namespace) -> None:
         cuda_graph_max_bs=0,
         enable_preemption=enable_preemption,
         enable_overlap_preemption=enable_preemption and args.enable_overlap_preemption,
-        dynamic_kv_allocation=enable_preemption,
-        decode_first=enable_preemption,
+        dynamic_kv_allocation=True,
+        decode_first=True,
         preempt_min_free_pages=args.preempt_min_free_pages,
     )
     try:
@@ -112,6 +116,7 @@ def run_worker(args: argparse.Namespace) -> None:
             "num_preemptions": llm.num_preemptions,
             "num_deferred_preemptions": llm.num_deferred_preemptions,
             "num_preemption_stalls": llm.num_preemption_stalls,
+            "num_prefill_fit_failures": llm.num_prefill_fit_failures,
             "num_resumed_preempted_reqs": llm.num_resumed_preempted_reqs,
             "output_lengths": [len(result["token_ids"]) for result in results],
             "token_ids": [result["token_ids"] for result in results],
@@ -195,6 +200,7 @@ def main() -> None:
                 "baseline_num_preemptions": baseline["num_preemptions"],
                 "baseline_output_lengths": baseline["output_lengths"],
                 "preempt_num_deferred_preemptions": preempt["num_deferred_preemptions"],
+                "preempt_num_prefill_fit_failures": preempt["num_prefill_fit_failures"],
                 "preempt_num_preemptions": preempt["num_preemptions"],
                 "preempt_num_preemption_stalls": preempt["num_preemption_stalls"],
                 "preempt_num_resumed_preempted_reqs": preempt[

@@ -70,6 +70,18 @@ class CacheManager:
             allocated = self._page_to_token(self._allocate(needed_pages))
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
+    def free_allocated_pages_for_reqs(self, reqs: List[Req]) -> None:
+        allocated_indices: List[torch.Tensor] = []
+        for req in reqs:
+            first_page = div_ceil(req.cached_len, self.page_size)
+            last_page = div_ceil(req.device_len, self.page_size)
+            if last_page <= first_page:
+                continue
+            first_pos, last_pos = first_page * self.page_size, last_page * self.page_size
+            allocated_indices.append(self.page_table[req.table_idx, first_pos:last_pos])
+        if allocated_indices:
+            self._free(torch.cat(allocated_indices))
+
     def cache_req(self, req: Req, *, finished: bool) -> None:
         # ==================================== valid cache region ====================================
         # [0, req.cached_len)                       This part is valid for attention kernel read/write.
@@ -83,9 +95,14 @@ class CacheManager:
         # [new_handle.cached_len, req.cached_len)   This part is tailing part that can not inserted into the prefix cache.
         #                                           We should free it if the request has finished.
         insert_ids = req.input_ids[: req.cached_len]
-        page_indices = self.page_table[req.table_idx, : req.cached_len]
+        page_indices = self.page_table[req.table_idx, : req.cached_len].clone()
         old_handle = req.cache_handle
         cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
+        if cached_len > old_handle.cached_len:
+            matched_indices = new_handle.get_matched_indices()
+            self.page_table[
+                req.table_idx, old_handle.cached_len : cached_len
+            ] = matched_indices[old_handle.cached_len : cached_len]
         # unlock until all operations on handle is done
         self.unlock(old_handle)
         # this part is already in the prefix cache, free it

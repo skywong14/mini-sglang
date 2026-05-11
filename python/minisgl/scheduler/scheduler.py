@@ -45,13 +45,14 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
 class ScheduleAction(NamedTuple):
+    step_id: int
     phase: str
-    batch_uids: List[int]
-    preempted_uids: List[int]
-    deferred_preempt_uids: List[int]
-    resumed_uids: List[int]
-    finished_uids: List[int]
-    aborted_uids: List[int]
+    batch_uids: Tuple[int, ...]
+    preempted_uids: Tuple[int, ...]
+    deferred_preempt_uids: Tuple[int, ...]
+    resumed_uids: Tuple[int, ...]
+    finished_uids: Tuple[int, ...]
+    aborted_uids: Tuple[int, ...]
 
 
 class Scheduler(SchedulerIOMixin):
@@ -96,6 +97,7 @@ class Scheduler(SchedulerIOMixin):
         self.num_deferred_preemptions = 0
         self.num_preemption_stalls = 0
         self.num_prefill_fit_failures = 0
+        self.schedule_step_id = 0
         self.last_schedule_action: ScheduleAction | None = None
         self.last_preempted_uids: List[int] = []
         self.protected_uids: Set[int] = set()
@@ -188,12 +190,14 @@ class Scheduler(SchedulerIOMixin):
             return
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        assert hasattr(batch, "max_token_finished_uids"), (
+            "Forward batch is missing max-token finished state"
+        )
+        max_token_finished_uids = batch.max_token_finished_uids
         processed_uids = {req.uid for req in batch.reqs}
         copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
         preempted: List[Tuple[int, torch.Tensor, SamplingParams]] = []
-        finished_uids: List[int] = []
-        aborted_uids: List[int] = []
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if req.uid in self.deferred_abort_uids:
@@ -202,13 +206,11 @@ class Scheduler(SchedulerIOMixin):
                     self.deferred_abort_uids.discard(req.uid)
                     self.deferred_preempt_uids.discard(req.uid)
                     self.deferred_preempt_reqs.pop(req.uid, None)
-                    aborted_uids.append(req.uid)
                     continue
                 if req.uid in self.aborted_uids:
                     self.decode_manager.remove_req(req)
                     self._free_req_resources_once(req)
                     self.aborted_uids.discard(req.uid)
-                    aborted_uids.append(req.uid)
                     continue
                 if isinstance(req, ChunkedReq):
                     continue
@@ -217,7 +219,9 @@ class Scheduler(SchedulerIOMixin):
                     continue
                 if req in self.released_reqs:
                     continue
-                next_token, finished = self._commit_sampled_token(req, next_tokens_cpu[i])
+                next_token, finished = self._commit_sampled_token(
+                    req, next_tokens_cpu[i], req.uid in max_token_finished_uids
+                )
                 reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
 
                 if req.uid in self.deferred_preempt_uids:
@@ -227,7 +231,6 @@ class Scheduler(SchedulerIOMixin):
                     self.decode_manager.remove_req(req)
                     if finished:
                         self.finished_uids.add(req.uid)
-                        finished_uids.append(req.uid)
                         self._free_req_resources_once(req)
                     else:
                         preempted.append(self._make_preempted_req(req))
@@ -237,25 +240,14 @@ class Scheduler(SchedulerIOMixin):
                         assert freed, f"Deferred victim {req.uid} resources were already released"
                 elif finished:
                     self.finished_uids.add(req.uid)
-                    finished_uids.append(req.uid)
                     self.decode_manager.remove_req(req)
                     self._free_req_resources_once(req)
                 elif batch.is_prefill:  # for prefill, non-chunk req, cache the prefix
                     self.cache_manager.cache_req(req, finished=False)
 
         self.protected_uids.difference_update(processed_uids)
-        preempted_uids = [uid for uid, _, _ in preempted]
         if preempted:
             self._finish_preempted_reqs(preempted)
-        self._record_schedule_action(
-            phase=f"process_{batch.phase}",
-            batch_uids=[req.uid for req in batch.reqs],
-            preempted_uids=preempted_uids,
-            deferred_preempt_uids=[],
-            resumed_uids=[],
-            finished_uids=finished_uids,
-            aborted_uids=aborted_uids,
-        )
         self.send_result(reply)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
@@ -338,14 +330,16 @@ class Scheduler(SchedulerIOMixin):
         finished_uids: List[int],
         aborted_uids: List[int],
     ) -> None:
+        self.schedule_step_id += 1
         self.last_schedule_action = ScheduleAction(
+            step_id=self.schedule_step_id,
             phase=phase,
-            batch_uids=batch_uids,
-            preempted_uids=preempted_uids,
-            deferred_preempt_uids=deferred_preempt_uids,
-            resumed_uids=resumed_uids,
-            finished_uids=finished_uids,
-            aborted_uids=aborted_uids,
+            batch_uids=tuple(batch_uids),
+            preempted_uids=tuple(preempted_uids),
+            deferred_preempt_uids=tuple(deferred_preempt_uids),
+            resumed_uids=tuple(resumed_uids),
+            finished_uids=tuple(finished_uids),
+            aborted_uids=tuple(aborted_uids),
         )
 
     def _can_preempt_now(self, req: Req) -> bool:
@@ -360,10 +354,12 @@ class Scheduler(SchedulerIOMixin):
     def _cannot_schedule_uids(self) -> Set[int]:
         return self.deferred_preempt_uids | self.deferred_abort_uids | self.aborted_uids
 
-    def _commit_sampled_token(self, req: Req, next_token: torch.Tensor) -> Tuple[int, bool]:
+    def _commit_sampled_token(
+        self, req: Req, next_token: torch.Tensor, max_token_finished: bool
+    ) -> Tuple[int, bool]:
         req.append_host(next_token.unsqueeze(0))
         next_token_int = int(next_token.item())
-        finished = not req.can_decode
+        finished = max_token_finished
         if not req.sampling_params.ignore_eos:
             finished |= next_token_int == self.eos_token_id
         return next_token_int, finished
@@ -497,6 +493,7 @@ class Scheduler(SchedulerIOMixin):
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs)
+        batch.kv_allocated = True
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
@@ -529,7 +526,15 @@ class Scheduler(SchedulerIOMixin):
             batch = self._maybe_preempt_to_fit(batch)
         if batch is None:
             return None
-        forward_input = self._prepare_batch(batch)
+        resumed_uids = self._resumed_preempted_uids(batch)
+        try:
+            forward_input = self._prepare_batch(batch)
+        except Exception:
+            if batch.is_prefill:
+                if getattr(batch, "kv_allocated", False):
+                    self.cache_manager.free_allocated_pages_for_reqs(batch.reqs)
+                self.prefill_manager.rollback_batch(batch)
+            raise
         if batch.is_prefill:
             self.prefill_manager.commit_batch(batch)
         self._record_schedule_action(
@@ -537,7 +542,7 @@ class Scheduler(SchedulerIOMixin):
             batch_uids=[req.uid for req in batch.reqs],
             preempted_uids=self.last_preempted_uids,
             deferred_preempt_uids=sorted(self.deferred_preempt_uids),
-            resumed_uids=[],
+            resumed_uids=resumed_uids,
             finished_uids=[],
             aborted_uids=[],
         )
@@ -554,25 +559,20 @@ class Scheduler(SchedulerIOMixin):
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
         forward_output = self.engine.forward_batch(batch, sample_args)
+        batch.max_token_finished_uids = {req.uid for req in batch.reqs if not req.can_decode}
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
-        resumed_uids = []
-        for req in forward_input.batch.reqs:
-            if req.uid in self.pending_preempted_uids:
-                self.pending_preempted_uids.remove(req.uid)
-                self.num_resumed_preempted_reqs += 1
-                resumed_uids.append(req.uid)
-        if resumed_uids:
-            self._record_schedule_action(
-                phase=f"forward_{batch.phase}",
-                batch_uids=[req.uid for req in batch.reqs],
-                preempted_uids=[],
-                deferred_preempt_uids=[],
-                resumed_uids=resumed_uids,
-                finished_uids=[],
-                aborted_uids=[],
-            )
+        for uid in self._resumed_preempted_uids(batch):
+            self.pending_preempted_uids.remove(uid)
+            self.num_resumed_preempted_reqs += 1
         return forward_output
+
+    def _resumed_preempted_uids(self, batch: Batch) -> List[int]:
+        return [
+            req.uid
+            for req in batch.reqs
+            if req.uid in self.pending_preempted_uids and not isinstance(req, ChunkedReq)
+        ]
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:

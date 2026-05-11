@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import pathlib
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=96)
     parser.add_argument("--max-extend-tokens", type=int, default=256)
     parser.add_argument("--preempt-min-free-pages", type=int, default=1)
+    parser.add_argument("--warmup-runs", type=int, default=1)
+    parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--worker-case", choices=["normal", "overlap"])
     parser.add_argument("--output-json")
     return parser.parse_args()
@@ -126,6 +129,7 @@ def run_worker(args: argparse.Namespace) -> None:
             "num_preemptions": llm.num_preemptions,
             "num_deferred_preemptions": llm.num_deferred_preemptions,
             "num_preemption_stalls": llm.num_preemption_stalls,
+            "num_prefill_fit_failures": llm.num_prefill_fit_failures,
             "num_resumed_preempted_reqs": llm.num_resumed_preempted_reqs,
             "output_lengths": output_lengths,
         }
@@ -173,16 +177,75 @@ def run_case(case: str, args: argparse.Namespace, output_json: pathlib.Path) -> 
     return json.loads(output_json.read_text(encoding="utf-8"))
 
 
+def mean_std(values: list[float]) -> dict:
+    assert len(values) > 0, "Cannot summarize an empty benchmark result list"
+    return {
+        "mean": statistics.mean(values),
+        "std": statistics.pstdev(values) if len(values) > 1 else 0.0,
+        "values": values,
+    }
+
+
+def percentile(values: list[float], pct: float) -> float:
+    assert len(values) > 0, "Cannot compute percentile of an empty list"
+    ordered = sorted(values)
+    index = round((len(ordered) - 1) * pct / 100.0)
+    return ordered[index]
+
+
+def summarize_runs(case: str, runs: list[dict]) -> dict:
+    avg_request_latency = [
+        statistics.mean(run["request_latency_s"]) for run in runs if run["request_latency_s"]
+    ]
+    p50_request_latency = [
+        percentile(run["request_latency_s"], 50.0) for run in runs if run["request_latency_s"]
+    ]
+    p95_request_latency = [
+        percentile(run["request_latency_s"], 95.0) for run in runs if run["request_latency_s"]
+    ]
+    avg_first_token_latency = [
+        statistics.mean(run["first_token_latency_s"])
+        for run in runs
+        if run["first_token_latency_s"]
+    ]
+    return {
+        "case": case,
+        "wall_time_s": mean_std([run["wall_time_s"] for run in runs]),
+        "tokens_per_s": mean_std([run["tokens_per_s"] for run in runs]),
+        "avg_request_latency_s": mean_std(avg_request_latency),
+        "p50_request_latency_s": mean_std(p50_request_latency),
+        "p95_request_latency_s": mean_std(p95_request_latency),
+        "avg_first_token_latency_s": mean_std(avg_first_token_latency),
+        "num_preemptions": [run["num_preemptions"] for run in runs],
+        "num_deferred_preemptions": [run["num_deferred_preemptions"] for run in runs],
+        "num_preemption_stalls": [run["num_preemption_stalls"] for run in runs],
+        "num_prefill_fit_failures": [run["num_prefill_fit_failures"] for run in runs],
+        "num_resumed_preempted_reqs": [run["num_resumed_preempted_reqs"] for run in runs],
+        "output_lengths": [run["output_lengths"] for run in runs],
+    }
+
+
+def run_repeated_case(case: str, args: argparse.Namespace, tmp: pathlib.Path) -> dict:
+    for i in range(args.warmup_runs):
+        run_case(case, args, tmp / f"{case}.warmup.{i}.json")
+    runs = [
+        run_case(case, args, tmp / f"{case}.repeat.{i}.json") for i in range(args.repeats)
+    ]
+    return summarize_runs(case, runs)
+
+
 def main() -> None:
     args = parse_args()
+    assert args.warmup_runs >= 0, "--warmup-runs must be non-negative"
+    assert args.repeats > 0, "--repeats must be positive"
     if args.worker_case is not None:
         run_worker(args)
         return
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = pathlib.Path(tmpdir)
-        normal = run_case("normal", args, tmp / "normal.json")
-        overlap = run_case("overlap", args, tmp / "overlap.json")
+        normal = run_repeated_case("normal", args, tmp)
+        overlap = run_repeated_case("overlap", args, tmp)
 
     print(json.dumps({"normal": normal, "overlap": overlap}, indent=2, sort_keys=True))
 

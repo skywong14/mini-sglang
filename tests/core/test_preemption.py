@@ -31,11 +31,13 @@ class FakeCacheManager:
     cached_finished: list[tuple[int, bool]] | None = None
     locked_handles: list[BaseCacheHandle] | None = None
     unlocked_handles: list[BaseCacheHandle] | None = None
+    freed_allocated_reqs: list[int] | None = None
 
     def __post_init__(self):
         self.cached_finished = []
         self.locked_handles = []
         self.unlocked_handles = []
+        self.freed_allocated_reqs = []
 
     @property
     def available_size(self):
@@ -60,6 +62,10 @@ class FakeCacheManager:
     def cache_req(self, req, *, finished: bool):
         assert self.cached_finished is not None
         self.cached_finished.append((req.uid, finished))
+
+    def free_allocated_pages_for_reqs(self, reqs):
+        assert self.freed_allocated_reqs is not None
+        self.freed_allocated_reqs.extend(req.uid for req in reqs)
 
     @contextmanager
     def lazy_free_region(self):
@@ -128,6 +134,7 @@ def _make_scheduler(policy: str, allocatable_pages: int = 1, margin: int = 0):
     scheduler.num_deferred_preemptions = 0
     scheduler.num_preemption_stalls = 0
     scheduler.num_prefill_fit_failures = 0
+    scheduler.schedule_step_id = 0
     scheduler.last_schedule_action = None
     scheduler.last_preempted_uids = []
     scheduler.protected_uids = set()
@@ -149,7 +156,12 @@ class FakeEvent:
         pass
 
 
-def _make_forward_data(batch: Batch, next_tokens: list[int]):
+def _make_forward_data(
+    batch: Batch, next_tokens: list[int], max_token_finished_uids: set[int] | None = None
+):
+    if max_token_finished_uids is None:
+        max_token_finished_uids = {req.uid for req in batch.reqs if not req.can_decode}
+    batch.max_token_finished_uids = max_token_finished_uids
     forward_input = ForwardInput(
         batch=batch,
         sample_args=None,
@@ -258,6 +270,65 @@ def test_chunked_prefill_no_fit_rolls_back_to_previous_chunk_state(monkeypatch):
     assert pending.chunked_req is old_chunk
     assert scheduler.table_manager.freed_slots == []
     assert scheduler.cache_manager.unlocked_handles == []
+
+
+def test_prefill_prepare_error_rolls_back_and_can_reschedule():
+    scheduler = _make_scheduler("largest_kv", allocatable_pages=1)
+    scheduler.cache_manager.admission_size = 8
+    scheduler.decode_first = False
+    scheduler.dynamic_kv_allocation = True
+    scheduler.prefill_budget = 8
+    input_ids = torch.arange(2, dtype=torch.int32)
+    scheduler.prefill_manager.add_preempted_req_front(
+        uid=1,
+        input_ids=input_ids,
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+
+    def raising_prepare(batch):
+        batch.kv_allocated = True
+        raise RuntimeError("prepare failed")
+
+    scheduler._prepare_batch = raising_prepare
+
+    with pytest.raises(RuntimeError, match="prepare failed"):
+        scheduler._schedule_next_batch()
+
+    assert [pending.uid for pending in scheduler.prefill_manager.pending_list] == [1]
+    assert torch.equal(scheduler.prefill_manager.pending_list[0].input_ids, input_ids)
+    assert scheduler.cache_manager.freed_allocated_reqs == [1]
+    assert scheduler.cache_manager.unlocked_handles == [DummyHandle(0)]
+    assert scheduler.table_manager.freed_slots == [15]
+    assert scheduler.prefill_manager._rollback_batch is None
+
+    scheduler._prepare_batch = lambda batch: batch
+    scheduled = scheduler._schedule_next_batch()
+
+    assert scheduled is not None
+    assert [req.uid for req in scheduled.reqs] == [1]
+    assert scheduler.prefill_manager.pending_list == []
+    assert scheduler.prefill_manager._rollback_batch is None
+
+
+def test_decode_prepare_error_does_not_attempt_prefill_rollback():
+    scheduler = _make_scheduler("largest_kv", allocatable_pages=1)
+    req = _make_decode_req(uid=1, cached_len=4)
+    scheduler.decode_first = True
+    scheduler.dynamic_kv_allocation = True
+    scheduler.prefill_budget = 8
+    scheduler.decode_manager.filter_reqs([req])
+
+    def raising_prepare(batch):
+        raise RuntimeError("decode prepare failed")
+
+    scheduler._prepare_batch = raising_prepare
+
+    with pytest.raises(RuntimeError, match="decode prepare failed"):
+        scheduler._schedule_next_batch()
+
+    assert scheduler.table_manager.freed_slots == []
+    assert scheduler.cache_manager.unlocked_handles == []
+    assert scheduler.prefill_manager._rollback_batch is None
 
 
 def test_preemption_requeues_with_remaining_budget_and_removes_decode_req():
@@ -477,6 +548,31 @@ def test_finished_request_is_released_once_for_stale_overlap_data():
     assert scheduler.sent_replies[1] == []
 
 
+def test_overlap_finish_uses_forward_time_snapshot_not_mutated_req_state():
+    scheduler = _make_scheduler("largest_kv", allocatable_pages=0)
+    req = _make_decode_req(uid=1, cached_len=4, output_len=2)
+
+    req.complete_one()
+    first_batch = Batch(reqs=[req], phase="decode")
+    first_data = _make_forward_data(first_batch, [10], max_token_finished_uids=set())
+
+    req.complete_one()
+    second_batch = Batch(reqs=[req], phase="decode")
+    second_data = _make_forward_data(second_batch, [11], max_token_finished_uids={1})
+
+    scheduler._process_last_data(first_data)
+    scheduler._process_last_data(second_data)
+
+    assert [(msg.uid, msg.next_token, msg.finished) for msg in scheduler.sent_replies[0]] == [
+        (1, 10, False)
+    ]
+    assert [(msg.uid, msg.next_token, msg.finished) for msg in scheduler.sent_replies[1]] == [
+        (1, 11, True)
+    ]
+    assert scheduler.table_manager.freed_slots == [1]
+    assert scheduler.cache_manager.cached_finished == [(1, True)]
+
+
 def test_abort_protected_request_defers_free_until_last_data_processed():
     scheduler = _make_scheduler("largest_kv", allocatable_pages=0)
     scheduler.enable_overlap_preemption = True
@@ -615,6 +711,71 @@ def test_resumed_preempted_request_counter_increments_once():
     assert sorted(scheduler.decode_manager.running_reqs) == [1]
 
 
+def test_chunked_resumed_preempted_request_keeps_priority_until_final_prefill():
+    scheduler = _make_scheduler("largest_kv", allocatable_pages=1)
+
+    class FakeEngine:
+        def forward_batch(self, batch, sample_args):
+            for req in batch.reqs:
+                req.complete_one()
+            return SimpleNamespace(
+                next_tokens_gpu=torch.tensor([7], dtype=torch.int32),
+                next_tokens_cpu=torch.tensor([7], dtype=torch.int32),
+                copy_done_event=FakeEvent(),
+            )
+
+    scheduler.engine = FakeEngine()
+    scheduler.token_pool = torch.zeros((4, 16), dtype=torch.int32)
+    scheduler.pending_preempted_uids = {1}
+
+    chunk = ChunkedReq(
+        input_ids=torch.arange(4, dtype=torch.int32),
+        table_idx=1,
+        cached_len=2,
+        output_len=8,
+        uid=1,
+        sampling_params=SamplingParams(max_tokens=8),
+        cache_handle=DummyHandle(2),
+    )
+    chunk_batch = Batch(reqs=[chunk], phase="prefill")
+    chunk_forward = ForwardInput(
+        batch=chunk_batch,
+        sample_args=None,
+        input_tuple=(torch.tensor([chunk.table_idx]), torch.tensor([0])),
+        write_tuple=(torch.tensor([chunk.table_idx]), torch.tensor([0])),
+    )
+
+    scheduler._forward(chunk_forward)
+
+    assert scheduler.pending_preempted_uids == {1}
+    assert scheduler.num_resumed_preempted_reqs == 0
+    assert scheduler.decode_manager.running_reqs == {}
+
+    final_req = Req(
+        input_ids=torch.arange(5, dtype=torch.int32),
+        table_idx=1,
+        cached_len=4,
+        output_len=8,
+        uid=1,
+        sampling_params=SamplingParams(max_tokens=8),
+        cache_handle=DummyHandle(2),
+    )
+    final_batch = Batch(reqs=[final_req], phase="prefill")
+    final_forward = ForwardInput(
+        batch=final_batch,
+        sample_args=None,
+        input_tuple=(torch.tensor([final_req.table_idx]), torch.tensor([0])),
+        write_tuple=(torch.tensor([final_req.table_idx]), torch.tensor([0])),
+    )
+
+    scheduler._forward(final_forward)
+    scheduler._forward(final_forward)
+
+    assert scheduler.pending_preempted_uids == set()
+    assert scheduler.num_resumed_preempted_reqs == 1
+    assert sorted(scheduler.decode_manager.running_reqs) == [1]
+
+
 def test_resumed_preempted_request_with_one_token_left_finishes_and_releases():
     scheduler = _make_scheduler("largest_kv", allocatable_pages=1)
     req = _make_decode_req(uid=1, cached_len=4, output_len=1)
@@ -704,6 +865,65 @@ def test_deferred_preempt_request_is_not_scheduled_again():
     assert [req.uid for req in scheduled.reqs] == [2]
 
 
+def test_finished_and_aborted_uids_are_limited_to_stale_forward_window():
+    scheduler = _make_scheduler("largest_kv", allocatable_pages=4)
+    protected = _make_decode_req(uid=1, cached_len=4)
+    batch = Batch(reqs=[protected], phase="decode")
+    data = _make_forward_data(batch, [10])
+    scheduler.finished_uids = {1, 2}
+    scheduler.aborted_uids = {1, 3, 4}
+    scheduler.deferred_abort_uids = {4}
+
+    scheduler._set_protected_forward_data(data)
+
+    assert scheduler.finished_uids == {1}
+    assert scheduler.aborted_uids == {1, 4}
+
+    scheduler._set_protected_forward_data(None)
+
+    assert scheduler.finished_uids == set()
+    assert scheduler.aborted_uids == {4}
+
+    scheduler.deferred_abort_uids = set()
+    scheduler._set_protected_forward_data(None)
+
+    assert scheduler.aborted_uids == set()
+
+
+def test_schedule_action_uses_step_id_and_immutable_uid_tuples():
+    scheduler = _make_scheduler("largest_kv", allocatable_pages=4)
+
+    scheduler._record_schedule_action(
+        phase="decode",
+        batch_uids=[2, 1],
+        preempted_uids=[4],
+        deferred_preempt_uids=[3],
+        resumed_uids=[2],
+        finished_uids=[],
+        aborted_uids=[],
+    )
+
+    assert scheduler.last_schedule_action is not None
+    assert scheduler.last_schedule_action.step_id == 1
+    assert scheduler.last_schedule_action.batch_uids == (2, 1)
+    assert scheduler.last_schedule_action.preempted_uids == (4,)
+    assert scheduler.last_schedule_action.deferred_preempt_uids == (3,)
+    assert scheduler.last_schedule_action.resumed_uids == (2,)
+
+    scheduler._record_schedule_action(
+        phase="prefill",
+        batch_uids=[],
+        preempted_uids=[],
+        deferred_preempt_uids=[],
+        resumed_uids=[],
+        finished_uids=[],
+        aborted_uids=[],
+    )
+
+    assert scheduler.last_schedule_action.step_id == 2
+    assert scheduler.last_schedule_action.batch_uids == ()
+
+
 def test_decode_first_resumes_preempted_request_before_more_decode():
     prefill_batch = Batch(reqs=[_make_decode_req(uid=1, cached_len=4)], phase="prefill")
     decode_batch = Batch(reqs=[_make_decode_req(uid=2, cached_len=4)], phase="decode")
@@ -738,6 +958,7 @@ def test_decode_first_resumes_preempted_request_before_more_decode():
     scheduler.protected_uids = set()
     scheduler.deferred_preempt_uids = set()
     scheduler.last_preempted_uids = []
+    scheduler.schedule_step_id = 0
     scheduler.last_schedule_action = None
     scheduler.prefill_manager = ResumePrefillManager()
     scheduler.decode_manager = RecordingDecodeManager()
@@ -749,6 +970,8 @@ def test_decode_first_resumes_preempted_request_before_more_decode():
     assert scheduled is prefill_batch
     assert scheduler.prefill_manager.calls == 1
     assert scheduler.decode_manager.calls == 0
+    assert scheduler.last_schedule_action.resumed_uids == (1,)
+    assert scheduler.last_schedule_action.batch_uids == (1,)
 
 
 def _make_run_forever_scheduler():
@@ -849,7 +1072,9 @@ def test_no_preemption_mode_keeps_prefill_first_scheduling():
     scheduler.dynamic_kv_allocation = False
     scheduler.prefill_budget = 123
     scheduler.deferred_preempt_uids = set()
+    scheduler.pending_preempted_uids = set()
     scheduler.last_preempted_uids = []
+    scheduler.schedule_step_id = 0
     scheduler.last_schedule_action = None
     scheduler.prefill_manager = RecordingPrefillManager()
     scheduler.decode_manager = RecordingDecodeManager()
@@ -888,7 +1113,9 @@ def test_no_preemption_mode_uses_decode_when_prefill_is_empty():
     scheduler.dynamic_kv_allocation = False
     scheduler.prefill_budget = 123
     scheduler.deferred_preempt_uids = set()
+    scheduler.pending_preempted_uids = set()
     scheduler.last_preempted_uids = []
+    scheduler.schedule_step_id = 0
     scheduler.last_schedule_action = None
     scheduler.prefill_manager = EmptyPrefillManager()
     scheduler.decode_manager = RecordingDecodeManager()

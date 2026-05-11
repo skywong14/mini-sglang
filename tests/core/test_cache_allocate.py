@@ -38,6 +38,15 @@ def _make_cache_manager(num_pages: int, page_size: int) -> CacheManager:
     return CacheManager(num_pages, page_size, page_table, type="radix")
 
 
+def _make_cache_manager_with_table(
+    num_pages: int, page_size: int, table_shape: tuple[int, int]
+) -> CacheManager:
+    page_table = torch.full(table_shape, -1, dtype=torch.int32)
+    ctx = core.Context(page_size=page_size)
+    core.set_global_ctx(ctx)
+    return CacheManager(num_pages, page_size, page_table, type="radix")
+
+
 def _insert_evictable(cm: CacheManager, input_ids: torch.Tensor, indices: torch.Tensor):
     """Insert a prefix into the radix cache so it becomes evictable."""
     cm.prefix_cache.insert_prefix(input_ids, indices)
@@ -269,6 +278,39 @@ class TestCacheManagerPageAccounting:
         assert cm.evictable_pages == 2
         assert cm.allocatable_pages == 2
         assert cm.can_allocate_reqs([_make_req(cached_len=0, device_len=8)])
+
+    def test_cache_req_remaps_duplicate_prefix_to_matched_pages_before_freeing(self):
+        cm = _make_cache_manager_with_table(num_pages=16, page_size=1, table_shape=(2, 16))
+        cm.free_slots = torch.empty(0, dtype=torch.int32)
+        input_ids = torch.arange(6, dtype=torch.int32)
+        root_handle = cm.prefix_cache.match_prefix(torch.empty(0, dtype=torch.int32)).cuda_handle
+
+        req0 = Req(
+            input_ids=input_ids,
+            table_idx=0,
+            cached_len=5,
+            output_len=2,
+            uid=0,
+            sampling_params=SamplingParams(max_tokens=2),
+            cache_handle=root_handle,
+        )
+        req1 = Req(
+            input_ids=input_ids,
+            table_idx=1,
+            cached_len=5,
+            output_len=2,
+            uid=1,
+            sampling_params=SamplingParams(max_tokens=2),
+            cache_handle=root_handle,
+        )
+        cm.page_table[0, :5] = torch.arange(0, 5, dtype=torch.int32)
+        cm.page_table[1, :5] = torch.arange(10, 15, dtype=torch.int32)
+
+        cm.cache_req(req0, finished=False)
+        cm.cache_req(req1, finished=False)
+
+        assert cm.page_table[1, :5].tolist() == cm.page_table[0, :5].tolist()
+        assert sorted(cm.free_slots.tolist()) == [10, 11, 12, 13, 14]
 
 
 if __name__ == "__main__":
