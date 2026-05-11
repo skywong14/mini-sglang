@@ -22,9 +22,9 @@ def parse_args() -> argparse.Namespace:
         description="Compare greedy outputs with and without preemption.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Recommended deferred-path pressure:
-  --baseline-num-pages 4096 --preempt-num-pages 256 --num-prompts 6
-  --prompt-repeat 28 --max-running-req 6 --max-tokens 96
-  --max-extend-tokens 256 --require-deferred-preemption
+  --baseline-num-pages 4096 --preempt-num-pages 384 --num-prompts 12
+  --prompt-repeat 8 --max-running-req 12 --max-tokens 96
+  --max-extend-tokens 384 --require-deferred-preemption
 """,
     )
     parser.add_argument("--model-path", default="Qwen/Qwen3-0.6B")
@@ -32,11 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-num-pages", type=int, default=4096)
     parser.add_argument("--preempt-num-pages", type=int, default=384)
     parser.add_argument("--page-size", type=int, default=1)
-    parser.add_argument("--max-running-req", type=int, default=4)
-    parser.add_argument("--num-prompts", type=int, default=4)
-    parser.add_argument("--prompt-repeat", type=int, default=20)
-    parser.add_argument("--max-tokens", type=int, default=64)
-    parser.add_argument("--max-extend-tokens", type=int, default=256)
+    parser.add_argument("--max-running-req", type=int, default=12)
+    parser.add_argument("--num-prompts", type=int, default=12)
+    parser.add_argument("--prompt-repeat", type=int, default=8)
+    parser.add_argument("--max-tokens", type=int, default=96)
+    parser.add_argument("--max-extend-tokens", type=int, default=384)
     parser.add_argument("--preempt-min-free-pages", type=int, default=1)
     parser.add_argument(
         "--enable-overlap-preemption",

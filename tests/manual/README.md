@@ -43,15 +43,17 @@ PYTHONPATH=python python tests/manual/preemption_greedy_correctness.py \
   --enable-overlap-preemption \
   --require-deferred-preemption \
   --baseline-num-pages 4096 \
-  --preempt-num-pages 256 \
-  --num-prompts 6 \
-  --prompt-repeat 28 \
-  --max-running-req 6 \
-  --max-tokens 96
+  --preempt-num-pages 384 \
+  --num-prompts 12 \
+  --prompt-repeat 8 \
+  --max-running-req 12 \
+  --max-tokens 96 \
+  --max-extend-tokens 384
 ```
 
 The `--require-deferred-preemption` variant should be used when validating the
-overlap-safe path specifically. It fails unless `num_deferred_preemptions > 0`.
+overlap-safe path specifically. The script defaults are tuned to exercise that
+path on `Qwen/Qwen3-0.6B`, and it fails unless `num_deferred_preemptions > 0`.
 
 ## Overlap Smoke
 
@@ -83,6 +85,12 @@ PYTHONPATH=python python tests/manual/preemption_overlap_benchmark.py \
   --warmup-runs 1 \
   --repeats 3
 ```
+
+The default benchmark workload is sized for `Qwen/Qwen3-0.6B` with a 384-page
+KV cache: 12 requests, 8 prompt repeats, 96 generated tokens, and
+`max_extend_tokens=384`. The script fails fast if any request is dropped or
+does not produce the requested output length. It also fails if normal mode does
+not preempt or overlap mode does not exercise deferred preemption.
 
 ## Counter Expectations
 

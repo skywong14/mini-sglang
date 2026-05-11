@@ -369,33 +369,11 @@ class Scheduler(SchedulerIOMixin):
         needed_pages = self.cache_manager.needed_pages_for_reqs(batch.reqs)
         return needed_pages + margin <= self.cache_manager.allocatable_pages
 
-    def _select_preemption_victim(self, reqs: List[Req]) -> Req:
-        if self.preemption_victim_policy == "largest_kv":
-            return max(
-                reqs,
-                key=lambda req: (
-                    (req.cached_len + self.cache_manager.page_size - 1)
-                    // self.cache_manager.page_size,
-                    req.uid,
-                ),
-            )
-        if self.preemption_victim_policy == "fcfs_tail":
-            return max(reqs, key=lambda req: req.uid)
-        raise ValueError(f"Unknown preemption victim policy: {self.preemption_victim_policy}")
-
-    def _preemption_candidates(self, reqs: List[Req]) -> List[Req]:
-        excluded_uids = self.finished_uids | self.aborted_uids | self.deferred_abort_uids
-        if self.enable_overlap_preemption:
-            excluded_uids = excluded_uids | self.deferred_preempt_uids
-        else:
-            excluded_uids = excluded_uids | self.protected_uids | self.deferred_preempt_uids
-        return [req for req in reqs if req.uid not in excluded_uids]
-
     def _make_preempted_req(self, req: Req) -> Tuple[int, torch.Tensor, SamplingParams]:
         remaining_tokens = req.remain_len
         assert remaining_tokens > 0, f"Decode victim {req.uid} has no remaining tokens"
         sampling_params = replace(req.sampling_params, max_tokens=remaining_tokens)
-        return req.uid, req.input_ids.clone(), sampling_params
+        return req.uid, req.input_ids, sampling_params
 
     def _preempt_now(self, victim: Req, preempted: List[Tuple[int, torch.Tensor, SamplingParams]]) -> None:
         removed = self.decode_manager.remove_uid(victim.uid)
@@ -444,13 +422,53 @@ class Scheduler(SchedulerIOMixin):
             )
 
         preempted: List[Tuple[int, torch.Tensor, SamplingParams]] = []
-        while len(batch.reqs) > 0 and not self._can_allocate_batch(batch):
-            candidates = self._preemption_candidates(batch.reqs)
-            if len(candidates) == 0:
+        margin = self.preempt_min_free_pages if self.enable_preemption and batch.is_decode else 0
+        needed_pages_by_uid = {
+            req.uid: self.cache_manager.needed_pages_for_reqs([req])
+            for req in batch.reqs
+        }
+        needed_pages = sum(needed_pages_by_uid.values())
+
+        def batch_fits() -> bool:
+            return needed_pages + margin <= self.cache_manager.allocatable_pages
+
+        def is_candidate(req: Req) -> bool:
+            if (
+                req.uid in self.finished_uids
+                or req.uid in self.aborted_uids
+                or req.uid in self.deferred_abort_uids
+                or req.uid in self.deferred_preempt_uids
+            ):
+                return False
+            return self.enable_overlap_preemption or req.uid not in self.protected_uids
+
+        while len(batch.reqs) > 0 and not batch_fits():
+            victim_index = None
+            victim = None
+            victim_key = None
+            for i, req in enumerate(batch.reqs):
+                if not is_candidate(req):
+                    continue
+                if self.preemption_victim_policy == "largest_kv":
+                    key = (
+                        (req.cached_len + self.cache_manager.page_size - 1)
+                        // self.cache_manager.page_size,
+                        req.uid,
+                    )
+                elif self.preemption_victim_policy == "fcfs_tail":
+                    key = req.uid
+                else:
+                    raise ValueError(
+                        f"Unknown preemption victim policy: {self.preemption_victim_policy}"
+                    )
+                if victim_key is None or key > victim_key:
+                    victim_index = i
+                    victim = req
+                    victim_key = key
+            if victim is None:
                 self.num_preemption_stalls += 1
                 self._finish_preempted_reqs(preempted)
                 return None
-            victim = self._select_preemption_victim(candidates)
             if self._can_preempt_now(victim):
                 self._preempt_now(victim, preempted)
             else:
@@ -458,13 +476,15 @@ class Scheduler(SchedulerIOMixin):
                     f"Decode victim {victim.uid} is not safe to preempt but is not protected"
                 )
                 self._defer_preemption(victim)
-            batch.reqs = [req for req in batch.reqs if req.uid != victim.uid]
+            needed_pages -= needed_pages_by_uid[victim.uid]
+            assert victim_index is not None
+            del batch.reqs[victim_index]
 
         self._finish_preempted_reqs(preempted)
 
         if len(batch.reqs) == 0:
             return None
-        if not self._can_allocate_batch(batch):
+        if not batch_fits():
             needed_pages = self.cache_manager.needed_pages_for_reqs(batch.reqs)
             raise RuntimeError(
                 "Decode batch still does not fit after preemption:"
@@ -477,13 +497,13 @@ class Scheduler(SchedulerIOMixin):
     def _finish_preempted_reqs(
         self, preempted: List[Tuple[int, torch.Tensor, SamplingParams]]
     ) -> None:
-        for uid, input_ids, sampling_params in reversed(preempted):
+        for uid, _, _ in preempted:
             assert uid not in self.pending_preempted_uids, f"Request {uid} is already pending"
-            self.prefill_manager.add_preempted_req_front(uid, input_ids, sampling_params)
             self.pending_preempted_uids.add(uid)
+        self.prefill_manager.add_preempted_reqs_front(preempted)
         self.last_preempted_uids = [uid for uid, _, _ in preempted]
         if self.last_preempted_uids:
-            logger.info_rank0(
+            logger.debug_rank0(
                 "Preempted decode requests: uids=%s, policy=%s, total_preemptions=%d",
                 self.last_preempted_uids,
                 self.preemption_victim_policy,

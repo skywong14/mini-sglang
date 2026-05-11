@@ -154,6 +154,15 @@ class PrefillManager:
         pending_req = PendingReq(uid, input_ids.clone(), sampling_params)
         self.pending_list.insert(0, pending_req)
 
+    def add_preempted_reqs_front(
+        self, reqs: List[Tuple[int, torch.Tensor, SamplingParams]]
+    ) -> None:
+        pending_reqs: List[PendingReq] = []
+        for uid, input_ids, sampling_params in reqs:
+            assert input_ids.is_cpu, "Preempted request input_ids must be on CPU"
+            pending_reqs.append(PendingReq(uid, input_ids.clone(), sampling_params))
+        self.pending_list = pending_reqs + self.pending_list
+
     def schedule_next_batch(
         self, prefill_budget: int, dynamic_kv_allocation: bool = False
     ) -> Batch | None:

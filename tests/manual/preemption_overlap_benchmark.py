@@ -26,11 +26,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--num-pages", type=int, default=384)
     parser.add_argument("--page-size", type=int, default=1)
-    parser.add_argument("--max-running-req", type=int, default=6)
-    parser.add_argument("--num-requests", type=int, default=6)
-    parser.add_argument("--prompt-repeat", type=int, default=24)
+    parser.add_argument("--max-running-req", type=int, default=12)
+    parser.add_argument("--num-requests", type=int, default=12)
+    parser.add_argument("--prompt-repeat", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=96)
-    parser.add_argument("--max-extend-tokens", type=int, default=256)
+    parser.add_argument("--max-extend-tokens", type=int, default=384)
     parser.add_argument("--preempt-min-free-pages", type=int, default=1)
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
@@ -110,6 +110,19 @@ def run_worker(args: argparse.Namespace) -> None:
         )
         end_time = time.perf_counter()
         output_lengths = [len(result["token_ids"]) for result in results]
+        assert output_lengths == [args.max_tokens] * args.num_requests, (
+            "Benchmark generated unexpected output lengths:"
+            f" got={output_lengths}, expected={[args.max_tokens] * args.num_requests}. "
+            "Check prompt length, max sequence length, and KV cache size."
+        )
+        assert llm.num_preemptions > 0, (
+            "Benchmark did not exercise preemption; increase request pressure or reduce KV pages."
+        )
+        if overlap:
+            assert llm.num_deferred_preemptions > 0, (
+                "Overlap benchmark did not exercise deferred preemption; "
+                "increase request pressure or reduce KV pages."
+            )
         total_tokens = sum(output_lengths)
         finish_times = [
             llm._finish_times.get(uid, end_time) for uid in range(len(output_lengths))
