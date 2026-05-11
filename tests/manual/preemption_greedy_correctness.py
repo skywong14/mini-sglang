@@ -37,6 +37,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run the preempt case with experimental overlap-safe preemption enabled.",
     )
+    parser.add_argument(
+        "--require-deferred-preemption",
+        action="store_true",
+        help="Require the preempt case to exercise deferred preemption.",
+    )
     parser.add_argument("--worker-case", choices=["baseline", "preempt"])
     parser.add_argument("--output-json")
     return parser.parse_args()
@@ -106,6 +111,7 @@ def run_worker(args: argparse.Namespace) -> None:
             "case": args.worker_case,
             "num_preemptions": llm.num_preemptions,
             "num_deferred_preemptions": llm.num_deferred_preemptions,
+            "num_preemption_stalls": llm.num_preemption_stalls,
             "num_resumed_preempted_reqs": llm.num_resumed_preempted_reqs,
             "output_lengths": [len(result["token_ids"]) for result in results],
             "token_ids": [result["token_ids"] for result in results],
@@ -155,6 +161,8 @@ def run_case(case: str, args: argparse.Namespace, output_json: pathlib.Path) -> 
     ]
     if args.enable_overlap_preemption:
         cmd.append("--enable-overlap-preemption")
+    if args.require_deferred_preemption:
+        cmd.append("--require-deferred-preemption")
     subprocess.run(cmd, env=env, check=True)
     return json.loads(output_json.read_text(encoding="utf-8"))
 
@@ -174,8 +182,10 @@ def main() -> None:
         preempt = run_case("preempt", args, tmp / "preempt.json")
 
     assert preempt["num_preemptions"] > 0, "Expected preempt run to preempt at least once"
-    if preempt["num_deferred_preemptions"] != 0:
-        assert preempt["num_deferred_preemptions"] > 0
+    if args.require_deferred_preemption:
+        assert preempt["num_deferred_preemptions"] > 0, (
+            "Expected preempt run to exercise deferred preemption"
+        )
     assert baseline["token_ids"] == preempt["token_ids"], (
         "Greedy token ids differ between baseline and preemption runs"
     )
@@ -186,6 +196,7 @@ def main() -> None:
                 "baseline_output_lengths": baseline["output_lengths"],
                 "preempt_num_deferred_preemptions": preempt["num_deferred_preemptions"],
                 "preempt_num_preemptions": preempt["num_preemptions"],
+                "preempt_num_preemption_stalls": preempt["num_preemption_stalls"],
                 "preempt_num_resumed_preempted_reqs": preempt[
                     "num_resumed_preempted_reqs"
                 ],

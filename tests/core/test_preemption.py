@@ -11,8 +11,9 @@ from minisgl.core import Batch, Req, SamplingParams
 from minisgl.kvcache import BaseCacheHandle
 from minisgl.message import AbortBackendMsg
 from minisgl.scheduler.decode import DecodeManager
-from minisgl.scheduler.prefill import PrefillAdder, PrefillManager
+from minisgl.scheduler.prefill import ChunkedReq, PrefillAdder, PrefillManager
 from minisgl.scheduler.scheduler import ForwardInput, Scheduler
+from minisgl.scheduler.utils import PendingReq
 from minisgl.server.args import parse_args
 
 
@@ -26,13 +27,35 @@ class DummyHandle(BaseCacheHandle):
 class FakeCacheManager:
     page_size: int = 4
     allocatable_pages: int = 1
+    admission_size: int | None = None
     cached_finished: list[tuple[int, bool]] | None = None
+    locked_handles: list[BaseCacheHandle] | None = None
+    unlocked_handles: list[BaseCacheHandle] | None = None
 
     def __post_init__(self):
         self.cached_finished = []
+        self.locked_handles = []
+        self.unlocked_handles = []
+
+    @property
+    def available_size(self):
+        if self.admission_size is not None:
+            return self.admission_size
+        return self.allocatable_pages * self.page_size
 
     def needed_pages_for_reqs(self, reqs):
         return len(reqs)
+
+    def match_req(self, req):
+        return SimpleNamespace(cuda_handle=DummyHandle(0))
+
+    def lock(self, handle):
+        assert self.locked_handles is not None
+        self.locked_handles.append(handle)
+
+    def unlock(self, handle):
+        assert self.unlocked_handles is not None
+        self.unlocked_handles.append(handle)
 
     def cache_req(self, req, *, finished: bool):
         assert self.cached_finished is not None
@@ -46,13 +69,25 @@ class FakeCacheManager:
 @dataclass
 class FakeTableManager:
     freed_slots: list[int] | None = None
+    num_slots: int = 16
 
     def __post_init__(self):
         self.freed_slots = []
+        self._free_slots = list(range(self.num_slots))
+        self.page_table = torch.zeros((self.num_slots, 64), dtype=torch.int32)
+        self.token_pool = torch.zeros_like(self.page_table, dtype=torch.int32)
+
+    @property
+    def available_size(self):
+        return len(self._free_slots)
+
+    def allocate(self):
+        return self._free_slots.pop()
 
     def free(self, slot: int):
         assert self.freed_slots is not None
         self.freed_slots.append(slot)
+        self._free_slots.append(slot)
 
 
 @pytest.fixture(autouse=True)
@@ -91,7 +126,9 @@ def _make_scheduler(policy: str, allocatable_pages: int = 1, margin: int = 0):
     scheduler.num_preempted_prefix_tokens = 0
     scheduler.num_resumed_preempted_reqs = 0
     scheduler.num_deferred_preemptions = 0
+    scheduler.num_preemption_stalls = 0
     scheduler.num_prefill_fit_failures = 0
+    scheduler.last_schedule_action = None
     scheduler.last_preempted_uids = []
     scheduler.protected_uids = set()
     scheduler.finished_uids = set()
@@ -149,12 +186,20 @@ def test_dynamic_prefill_estimate_ignores_output_len():
 
 
 def test_prefill_no_fit_returns_none_and_counts_failure(monkeypatch):
-    scheduler = _make_scheduler("largest_kv", allocatable_pages=1)
-    reqs = [
-        _make_decode_req(uid=1, cached_len=4),
-        _make_decode_req(uid=2, cached_len=4),
-    ]
-    batch = Batch(reqs=list(reqs), phase="prefill")
+    scheduler = _make_scheduler("largest_kv", allocatable_pages=0)
+    scheduler.cache_manager.admission_size = 8
+    input_ids = torch.arange(2, dtype=torch.int32)
+    scheduler.prefill_manager.add_preempted_req_front(
+        uid=1,
+        input_ids=input_ids,
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+    batch = scheduler.prefill_manager.schedule_next_batch(
+        prefill_budget=8, dynamic_kv_allocation=True
+    )
+    assert batch is not None
+    table_idx = batch.reqs[0].table_idx
+    cache_handle = batch.reqs[0].cache_handle
     warnings = []
     monkeypatch.setattr(
         scheduler_module.logger,
@@ -167,11 +212,52 @@ def test_prefill_no_fit_returns_none_and_counts_failure(monkeypatch):
     assert new_batch is None
     assert scheduler.num_prefill_fit_failures == 1
     assert scheduler.num_preemptions == 0
-    assert [req.uid for req in batch.reqs] == [1, 2]
+    assert [req.uid for req in scheduler.prefill_manager.pending_list] == [1]
+    assert torch.equal(scheduler.prefill_manager.pending_list[0].input_ids, input_ids)
+    assert scheduler.table_manager.freed_slots == [table_idx]
+    assert scheduler.cache_manager.unlocked_handles == [cache_handle]
     assert len(warnings) == 1
     args, kwargs = warnings[0]
     assert kwargs == {}
-    assert args[1:] == (2, 1, "prefill", [1, 2])
+    assert args[1:] == (1, 0, "prefill", [1])
+
+
+def test_chunked_prefill_no_fit_rolls_back_to_previous_chunk_state(monkeypatch):
+    scheduler = _make_scheduler("largest_kv", allocatable_pages=0)
+    scheduler.cache_manager.admission_size = 8
+    sampling_params = SamplingParams(max_tokens=8)
+    old_chunk = ChunkedReq(
+        input_ids=torch.arange(4, dtype=torch.int32),
+        table_idx=1,
+        cached_len=2,
+        output_len=8,
+        uid=1,
+        sampling_params=sampling_params,
+        cache_handle=DummyHandle(2),
+    )
+    old_chunk.complete_one()
+    pending = PendingReq(
+        uid=1,
+        input_ids=torch.arange(8, dtype=torch.int32),
+        sampling_params=sampling_params,
+        chunked_req=old_chunk,
+    )
+    scheduler.prefill_manager.pending_list = [pending]
+    monkeypatch.setattr(scheduler_module.logger, "warning_rank0", lambda *args, **kwargs: None)
+
+    batch = scheduler.prefill_manager.schedule_next_batch(
+        prefill_budget=2, dynamic_kv_allocation=True
+    )
+    assert batch is not None
+    assert isinstance(batch.reqs[0], ChunkedReq)
+    assert pending.chunked_req is batch.reqs[0]
+
+    assert scheduler._maybe_preempt_to_fit(batch) is None
+
+    assert scheduler.prefill_manager.pending_list == [pending]
+    assert pending.chunked_req is old_chunk
+    assert scheduler.table_manager.freed_slots == []
+    assert scheduler.cache_manager.unlocked_handles == []
 
 
 def test_preemption_requeues_with_remaining_budget_and_removes_decode_req():
@@ -362,7 +448,8 @@ def test_protected_request_can_be_preempted_after_process_last_data():
 
     scheduler._process_last_data(data)
     assert scheduler.protected_uids == set()
-    assert scheduler.num_deferred_preemptions == 1
+    assert scheduler.num_deferred_preemptions == 0
+    assert scheduler.num_preemption_stalls == 1
 
     assert scheduler._maybe_preempt_to_fit(Batch(reqs=[req], phase="decode")) is None
     assert scheduler.last_preempted_uids == [1]
@@ -380,9 +467,9 @@ def test_finished_request_is_released_once_for_stale_overlap_data():
     data = _make_forward_data(batch, [10])
 
     scheduler._process_last_data(data)
-    scheduler._process_last_data(data)
-
     assert scheduler.finished_uids == {1}
+    assert scheduler._process_last_data(data) is None
+    assert scheduler.finished_uids == set()
     assert scheduler.table_manager.freed_slots == [1]
     assert scheduler.cache_manager.cached_finished == [(1, True)]
     assert len(scheduler.sent_replies) == 2
@@ -413,10 +500,53 @@ def test_abort_protected_request_defers_free_until_last_data_processed():
     scheduler._process_last_data(data)
 
     assert scheduler.deferred_abort_uids == set()
+    assert scheduler.aborted_uids == set()
     assert scheduler.table_manager.freed_slots == [1]
     assert scheduler.cache_manager.cached_finished == [(1, True)]
     assert scheduler.sent_replies == [[], []]
     assert torch.equal(req.input_ids, original_input_ids)
+
+
+def test_abort_protected_chunked_request_clears_deferred_state_and_frees_once():
+    scheduler = _make_scheduler("largest_kv", allocatable_pages=0)
+    scheduler.enable_overlap_preemption = True
+    sampling_params = SamplingParams(max_tokens=8)
+    chunked = ChunkedReq(
+        input_ids=torch.arange(4, dtype=torch.int32),
+        table_idx=1,
+        cached_len=2,
+        output_len=8,
+        uid=1,
+        sampling_params=sampling_params,
+        cache_handle=DummyHandle(2),
+    )
+    chunked.complete_one()
+    scheduler.prefill_manager.pending_list = [
+        PendingReq(
+            uid=1,
+            input_ids=torch.arange(8, dtype=torch.int32),
+            sampling_params=sampling_params,
+            chunked_req=chunked,
+        )
+    ]
+    batch = Batch(reqs=[chunked], phase="prefill")
+    data = _make_forward_data(batch, [0])
+    scheduler._set_protected_forward_data(data)
+
+    scheduler._process_one_msg(AbortBackendMsg(uid=chunked.uid))
+
+    assert scheduler.deferred_abort_uids == {1}
+    assert scheduler.prefill_manager.pending_list == []
+    assert scheduler.table_manager.freed_slots == []
+
+    scheduler._process_last_data(data)
+    scheduler._process_last_data(data)
+
+    assert scheduler.deferred_abort_uids == set()
+    assert scheduler.aborted_uids == set()
+    assert scheduler.table_manager.freed_slots == [1]
+    assert scheduler.cache_manager.cached_finished == [(1, True)]
+    assert scheduler.sent_replies == [[], []]
 
 
 def test_aborted_request_is_not_selected_as_preemption_victim():
@@ -447,7 +577,8 @@ def test_preempted_request_is_requeued_once_when_protected_batch_cannot_fit():
     assert scheduler.last_preempted_uids == [2]
     assert [pending.uid for pending in scheduler.prefill_manager.pending_list] == [2]
     assert scheduler.pending_preempted_uids == {2}
-    assert scheduler.num_deferred_preemptions == 1
+    assert scheduler.num_deferred_preemptions == 0
+    assert scheduler.num_preemption_stalls == 1
     assert scheduler.table_manager.freed_slots == [2]
 
 
@@ -458,6 +589,8 @@ def test_resumed_preempted_request_counter_increments_once():
 
     class FakeEngine:
         def forward_batch(self, batch, sample_args):
+            for req in batch.reqs:
+                req.complete_one()
             return SimpleNamespace(
                 next_tokens_gpu=torch.tensor([7], dtype=torch.int32),
                 next_tokens_cpu=torch.tensor([7], dtype=torch.int32),
@@ -480,6 +613,43 @@ def test_resumed_preempted_request_counter_increments_once():
     assert scheduler.pending_preempted_uids == set()
     assert scheduler.num_resumed_preempted_reqs == 1
     assert sorted(scheduler.decode_manager.running_reqs) == [1]
+
+
+def test_resumed_preempted_request_with_one_token_left_finishes_and_releases():
+    scheduler = _make_scheduler("largest_kv", allocatable_pages=1)
+    req = _make_decode_req(uid=1, cached_len=4, output_len=1)
+    batch = Batch(reqs=[req], phase="prefill")
+
+    class FakeEngine:
+        def forward_batch(self, batch, sample_args):
+            for req in batch.reqs:
+                req.complete_one()
+            return SimpleNamespace(
+                next_tokens_gpu=torch.tensor([7], dtype=torch.int32),
+                next_tokens_cpu=torch.tensor([7], dtype=torch.int32),
+                copy_done_event=FakeEvent(),
+            )
+
+    scheduler.engine = FakeEngine()
+    scheduler.token_pool = torch.zeros((2, 16), dtype=torch.int32)
+    scheduler.pending_preempted_uids = {req.uid}
+    forward_input = ForwardInput(
+        batch=batch,
+        sample_args=None,
+        input_tuple=(torch.tensor([req.table_idx]), torch.tensor([0])),
+        write_tuple=(torch.tensor([req.table_idx]), torch.tensor([0])),
+    )
+
+    scheduler._forward(forward_input)
+    scheduler._process_last_data(_make_forward_data(batch, [7]))
+
+    assert scheduler.pending_preempted_uids == set()
+    assert scheduler.num_resumed_preempted_reqs == 1
+    assert scheduler.table_manager.freed_slots == [1]
+    assert scheduler.cache_manager.cached_finished == [(1, True)]
+    assert [(msg.uid, msg.next_token, msg.finished) for msg in scheduler.sent_replies[0]] == [
+        (1, 7, True)
+    ]
 
 
 def test_decode_scheduling_excludes_protected_uids_when_preemption_is_enabled():
@@ -548,6 +718,9 @@ def test_decode_first_resumes_preempted_request_before_more_decode():
             self.calls += 1
             return prefill_batch
 
+        def commit_batch(self, batch):
+            pass
+
     class RecordingDecodeManager:
         def __init__(self):
             self.calls = 0
@@ -563,6 +736,9 @@ def test_decode_first_resumes_preempted_request_before_more_decode():
     scheduler.prefill_budget = 123
     scheduler.pending_preempted_uids = {1}
     scheduler.protected_uids = set()
+    scheduler.deferred_preempt_uids = set()
+    scheduler.last_preempted_uids = []
+    scheduler.last_schedule_action = None
     scheduler.prefill_manager = ResumePrefillManager()
     scheduler.decode_manager = RecordingDecodeManager()
     scheduler._maybe_preempt_to_fit = lambda batch: batch
@@ -656,6 +832,9 @@ def test_no_preemption_mode_keeps_prefill_first_scheduling():
             self.calls.append((prefill_budget, dynamic_kv_allocation))
             return prefill_batch
 
+        def commit_batch(self, batch):
+            pass
+
     class RecordingDecodeManager:
         def __init__(self):
             self.calls = 0
@@ -669,6 +848,9 @@ def test_no_preemption_mode_keeps_prefill_first_scheduling():
     scheduler.decode_first = False
     scheduler.dynamic_kv_allocation = False
     scheduler.prefill_budget = 123
+    scheduler.deferred_preempt_uids = set()
+    scheduler.last_preempted_uids = []
+    scheduler.last_schedule_action = None
     scheduler.prefill_manager = RecordingPrefillManager()
     scheduler.decode_manager = RecordingDecodeManager()
     scheduler._maybe_preempt_to_fit = lambda batch: batch
@@ -705,6 +887,9 @@ def test_no_preemption_mode_uses_decode_when_prefill_is_empty():
     scheduler.decode_first = False
     scheduler.dynamic_kv_allocation = False
     scheduler.prefill_budget = 123
+    scheduler.deferred_preempt_uids = set()
+    scheduler.last_preempted_uids = []
+    scheduler.last_schedule_action = None
     scheduler.prefill_manager = EmptyPrefillManager()
     scheduler.decode_manager = RecordingDecodeManager()
     scheduler._maybe_preempt_to_fit = lambda batch: batch
@@ -741,3 +926,16 @@ def test_server_args_parse_preemption_flags():
     assert args.decode_first
     assert args.preemption_victim_policy == "fcfs_tail"
     assert args.preempt_min_free_pages == 3
+
+
+def test_server_args_reject_overlap_preemption_without_preemption():
+    with pytest.raises(ValueError, match="requires --enable-preemption"):
+        parse_args(
+            [
+                "--model-path",
+                "dummy-model",
+                "--dtype",
+                "float16",
+                "--enable-overlap-preemption",
+            ]
+        )

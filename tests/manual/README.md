@@ -31,11 +31,13 @@ Useful knobs when forcing more pressure:
 PYTHONPATH=python python tests/manual/preemption_greedy_correctness.py \
   --model-path Qwen/Qwen3-0.6B \
   --enable-overlap-preemption \
+  --require-deferred-preemption \
   --baseline-num-pages 4096 \
-  --preempt-num-pages 384 \
-  --num-prompts 4 \
-  --prompt-repeat 20 \
-  --max-tokens 64
+  --preempt-num-pages 256 \
+  --num-prompts 6 \
+  --prompt-repeat 28 \
+  --max-running-req 6 \
+  --max-tokens 96
 ```
 
 ## Overlap Smoke
@@ -51,4 +53,16 @@ Runs one small-cache preemption workload and prints:
 PYTHONPATH=python python tests/manual/preemption_smoke.py \
   --model-path Qwen/Qwen3-0.6B \
   --enable-overlap-preemption
+```
+
+## Overlap Benchmark
+
+Compares normal preemption (`MINISGL_DISABLE_OVERLAP_SCHEDULING=1`) against
+overlap preemption (`MINISGL_DISABLE_OVERLAP_SCHEDULING=0`) with the same
+small-cache workload. It prints wall time, output tokens/s, per-request latency,
+first-token latency, and preemption/deferred/resume counters.
+
+```bash
+PYTHONPATH=python python tests/manual/preemption_overlap_benchmark.py \
+  --model-path Qwen/Qwen3-0.6B
 ```

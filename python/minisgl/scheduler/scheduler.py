@@ -44,6 +44,16 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
+class ScheduleAction(NamedTuple):
+    phase: str
+    batch_uids: List[int]
+    preempted_uids: List[int]
+    deferred_preempt_uids: List[int]
+    resumed_uids: List[int]
+    finished_uids: List[int]
+    aborted_uids: List[int]
+
+
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from minisgl.engine import Engine
@@ -70,6 +80,8 @@ class Scheduler(SchedulerIOMixin):
         self.config = config
         self.enable_preemption = config.enable_preemption
         self.enable_overlap_preemption = config.enable_overlap_preemption
+        if self.enable_overlap_preemption and not self.enable_preemption:
+            raise ValueError("enable_overlap_preemption requires enable_preemption")
         self.dynamic_kv_allocation = config.dynamic_kv_allocation or config.enable_preemption
         self.decode_first = config.decode_first or config.enable_preemption
         self.preemption_victim_policy = config.preemption_victim_policy
@@ -82,7 +94,9 @@ class Scheduler(SchedulerIOMixin):
         self.num_preempted_prefix_tokens = 0
         self.num_resumed_preempted_reqs = 0
         self.num_deferred_preemptions = 0
+        self.num_preemption_stalls = 0
         self.num_prefill_fit_failures = 0
+        self.last_schedule_action: ScheduleAction | None = None
         self.last_preempted_uids: List[int] = []
         self.protected_uids: Set[int] = set()
         self.finished_uids: Set[int] = set()
@@ -137,14 +151,14 @@ class Scheduler(SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
-        self.protected_uids = set()
+        self._set_protected_forward_data(None)
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
             ongoing_data = (forward_input, self._forward(forward_input))
 
         self._process_last_data(ongoing_data)
-        self.protected_uids = set()
+        self._set_protected_forward_data(None)
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
@@ -178,27 +192,30 @@ class Scheduler(SchedulerIOMixin):
         copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
         preempted: List[Tuple[int, torch.Tensor, SamplingParams]] = []
+        finished_uids: List[int] = []
+        aborted_uids: List[int] = []
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
-                if isinstance(req, ChunkedReq):
-                    continue
                 if req.uid in self.deferred_abort_uids:
                     self.decode_manager.remove_req(req)
                     self._free_req_resources_once(req)
                     self.deferred_abort_uids.discard(req.uid)
                     self.deferred_preempt_uids.discard(req.uid)
                     self.deferred_preempt_reqs.pop(req.uid, None)
+                    aborted_uids.append(req.uid)
                     continue
                 if req.uid in self.aborted_uids:
                     self.decode_manager.remove_req(req)
                     self._free_req_resources_once(req)
+                    self.aborted_uids.discard(req.uid)
+                    aborted_uids.append(req.uid)
+                    continue
+                if isinstance(req, ChunkedReq):
                     continue
                 if req.uid in self.finished_uids:
+                    self.finished_uids.discard(req.uid)
                     continue
-                if req.uid in self.pending_preempted_uids:
-                    assert req.uid not in self.deferred_preempt_uids, (
-                        f"Request {req.uid} cannot be both pending and deferred"
-                    )
+                if req in self.released_reqs:
                     continue
                 next_token, finished = self._commit_sampled_token(req, next_tokens_cpu[i])
                 reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
@@ -210,6 +227,7 @@ class Scheduler(SchedulerIOMixin):
                     self.decode_manager.remove_req(req)
                     if finished:
                         self.finished_uids.add(req.uid)
+                        finished_uids.append(req.uid)
                         self._free_req_resources_once(req)
                     else:
                         preempted.append(self._make_preempted_req(req))
@@ -219,14 +237,25 @@ class Scheduler(SchedulerIOMixin):
                         assert freed, f"Deferred victim {req.uid} resources were already released"
                 elif finished:
                     self.finished_uids.add(req.uid)
+                    finished_uids.append(req.uid)
                     self.decode_manager.remove_req(req)
                     self._free_req_resources_once(req)
                 elif batch.is_prefill:  # for prefill, non-chunk req, cache the prefix
                     self.cache_manager.cache_req(req, finished=False)
 
         self.protected_uids.difference_update(processed_uids)
+        preempted_uids = [uid for uid, _, _ in preempted]
         if preempted:
             self._finish_preempted_reqs(preempted)
+        self._record_schedule_action(
+            phase=f"process_{batch.phase}",
+            batch_uids=[req.uid for req in batch.reqs],
+            preempted_uids=preempted_uids,
+            deferred_preempt_uids=[],
+            resumed_uids=[],
+            finished_uids=finished_uids,
+            aborted_uids=aborted_uids,
+        )
         self.send_result(reply)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
@@ -266,8 +295,10 @@ class Scheduler(SchedulerIOMixin):
                 self.deferred_preempt_uids.discard(msg.uid)
                 self.deferred_preempt_reqs.pop(msg.uid, None)
                 self.decode_manager.remove_uid(msg.uid)
+                req_to_free = None
             else:
                 req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
+                self.aborted_uids.discard(msg.uid)
             if req_to_free is not None:
                 self._free_req_resources_once(req_to_free)
         else:
@@ -291,7 +322,31 @@ class Scheduler(SchedulerIOMixin):
         return {req.uid for req in data[0].batch.reqs}
 
     def _set_protected_forward_data(self, data: ForwardData | None) -> None:
-        self.protected_uids = self._forward_data_uids(data)
+        protected_uids = self._forward_data_uids(data)
+        self.finished_uids.intersection_update(protected_uids)
+        self.aborted_uids.intersection_update(protected_uids | self.deferred_abort_uids)
+        self.protected_uids = protected_uids
+
+    def _record_schedule_action(
+        self,
+        *,
+        phase: str,
+        batch_uids: List[int],
+        preempted_uids: List[int],
+        deferred_preempt_uids: List[int],
+        resumed_uids: List[int],
+        finished_uids: List[int],
+        aborted_uids: List[int],
+    ) -> None:
+        self.last_schedule_action = ScheduleAction(
+            phase=phase,
+            batch_uids=batch_uids,
+            preempted_uids=preempted_uids,
+            deferred_preempt_uids=deferred_preempt_uids,
+            resumed_uids=resumed_uids,
+            finished_uids=finished_uids,
+            aborted_uids=aborted_uids,
+        )
 
     def _can_preempt_now(self, req: Req) -> bool:
         return (
@@ -373,6 +428,7 @@ class Scheduler(SchedulerIOMixin):
         if batch.is_prefill:
             needed_pages = self.cache_manager.needed_pages_for_reqs(batch.reqs)
             self.num_prefill_fit_failures += 1
+            self.prefill_manager.rollback_batch(batch)
             logger.warning_rank0(
                 "Prefill batch does not fit after admission: "
                 "needed_pages=%d, allocatable_pages=%d, phase=%s, batch_uids=%s",
@@ -395,7 +451,7 @@ class Scheduler(SchedulerIOMixin):
         while len(batch.reqs) > 0 and not self._can_allocate_batch(batch):
             candidates = self._preemption_candidates(batch.reqs)
             if len(candidates) == 0:
-                self.num_deferred_preemptions += 1
+                self.num_preemption_stalls += 1
                 self._finish_preempted_reqs(preempted)
                 return None
             victim = self._select_preemption_victim(candidates)
@@ -471,7 +527,21 @@ class Scheduler(SchedulerIOMixin):
             ) or self._schedule_decode_batch()
         if batch is not None:
             batch = self._maybe_preempt_to_fit(batch)
-        return self._prepare_batch(batch) if batch else None
+        if batch is None:
+            return None
+        forward_input = self._prepare_batch(batch)
+        if batch.is_prefill:
+            self.prefill_manager.commit_batch(batch)
+        self._record_schedule_action(
+            phase=batch.phase,
+            batch_uids=[req.uid for req in batch.reqs],
+            preempted_uids=self.last_preempted_uids,
+            deferred_preempt_uids=sorted(self.deferred_preempt_uids),
+            resumed_uids=[],
+            finished_uids=[],
+            aborted_uids=[],
+        )
+        return forward_input
 
     def _schedule_decode_batch(self) -> Batch | None:
         if self.enable_preemption:
@@ -486,10 +556,22 @@ class Scheduler(SchedulerIOMixin):
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        resumed_uids = []
         for req in forward_input.batch.reqs:
-            if req.can_decode and req.uid in self.pending_preempted_uids:
+            if req.uid in self.pending_preempted_uids:
                 self.pending_preempted_uids.remove(req.uid)
                 self.num_resumed_preempted_reqs += 1
+                resumed_uids.append(req.uid)
+        if resumed_uids:
+            self._record_schedule_action(
+                phase=f"forward_{batch.phase}",
+                batch_uids=[req.uid for req in batch.reqs],
+                preempted_uids=[],
+                deferred_preempt_uids=[],
+                resumed_uids=resumed_uids,
+                finished_uids=[],
+                aborted_uids=[],
+            )
         return forward_output
 
 

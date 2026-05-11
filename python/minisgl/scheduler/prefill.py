@@ -138,6 +138,11 @@ class PrefillManager:
     table_manager: TableManager
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
+    _rollback_batch: Batch | None = field(default=None, init=False)
+    _rollback_pending_list: List[PendingReq] | None = field(default=None, init=False)
+    _rollback_chunked_reqs: List[Tuple[PendingReq, ChunkedReq | None]] = field(
+        default_factory=list, init=False
+    )
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
@@ -152,6 +157,7 @@ class PrefillManager:
     def schedule_next_batch(
         self, prefill_budget: int, dynamic_kv_allocation: bool = False
     ) -> Batch | None:
+        assert self._rollback_batch is None, "Previous prefill batch was not committed"
         if len(self.pending_list) == 0:
             return None
 
@@ -166,8 +172,11 @@ class PrefillManager:
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
+        rollback_pending_list = list(self.pending_list)
+        rollback_chunked_reqs: List[Tuple[PendingReq, ChunkedReq | None]] = []
         for pending_req in self.pending_list:
             if req := adder.try_add_one(pending_req):
+                rollback_chunked_reqs.append((pending_req, pending_req.chunked_req))
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
                     pending_req.chunked_req = req
@@ -178,7 +187,35 @@ class PrefillManager:
         if len(reqs) == 0:
             return None
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]
-        return Batch(reqs=reqs, phase="prefill")
+        batch = Batch(reqs=reqs, phase="prefill")
+        self._rollback_batch = batch
+        self._rollback_pending_list = rollback_pending_list
+        self._rollback_chunked_reqs = rollback_chunked_reqs
+        return batch
+
+    def rollback_batch(self, batch: Batch) -> None:
+        assert batch.is_prefill, "Only prefill batches can be rolled back"
+        assert self._rollback_batch is batch, "Can only roll back the latest prefill batch"
+        assert self._rollback_pending_list is not None, "Missing prefill rollback state"
+        for pending_req, old_chunked_req in self._rollback_chunked_reqs:
+            pending_req.chunked_req = old_chunked_req
+        for req, (_, old_chunked_req) in zip(batch.reqs, self._rollback_chunked_reqs):
+            if old_chunked_req is None:
+                self.table_manager.free(req.table_idx)
+                self.cache_manager.unlock(req.cache_handle)
+        self.pending_list = self._rollback_pending_list
+        self._clear_rollback()
+
+    def commit_batch(self, batch: Batch) -> None:
+        if not batch.is_prefill:
+            return
+        assert self._rollback_batch is batch, "Can only commit the latest prefill batch"
+        self._clear_rollback()
+
+    def _clear_rollback(self) -> None:
+        self._rollback_batch = None
+        self._rollback_pending_list = None
+        self._rollback_chunked_reqs = []
 
     def abort_req(self, uid: int) -> Req | None:
         for i, req in enumerate(self.pending_list):

@@ -312,6 +312,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     del kwargs["tensor_parallel_size"]
 
     result = ServerArgs(**kwargs)
+    if result.enable_overlap_preemption and not result.enable_preemption:
+        raise ValueError("--enable-overlap-preemption requires --enable-preemption")
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell
