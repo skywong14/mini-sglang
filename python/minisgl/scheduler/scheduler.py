@@ -81,16 +81,22 @@ class Scheduler(SchedulerIOMixin):
         self.config = config
         self.enable_preemption = config.enable_preemption
         self.enable_overlap_preemption = config.enable_overlap_preemption
-        if self.enable_overlap_preemption and not self.enable_preemption:
-            raise ValueError("enable_overlap_preemption requires enable_preemption")
         self.dynamic_kv_allocation = config.dynamic_kv_allocation or config.enable_preemption
         self.decode_first = config.decode_first or config.enable_preemption
         self.preemption_victim_policy = config.preemption_victim_policy
         self.preempt_min_free_pages = config.preempt_min_free_pages
-        if self.preemption_victim_policy not in ["largest_kv", "fcfs_tail"]:
-            raise ValueError(f"Unknown preemption victim policy: {self.preemption_victim_policy}")
-        if self.preempt_min_free_pages < 0:
-            raise ValueError("preempt_min_free_pages must be non-negative")
+        self.preempt_prefill_decode_reserve_pages = (
+            config.preempt_prefill_decode_reserve_pages
+        )
+        if self.enable_preemption and self.preempt_min_free_pages >= self.engine.num_pages:
+            raise ValueError("preempt_min_free_pages must be less than available KV pages")
+        if (
+            self.enable_preemption
+            and self.preempt_prefill_decode_reserve_pages >= self.engine.num_pages
+        ):
+            raise ValueError(
+                "preempt_prefill_decode_reserve_pages must be less than available KV pages"
+            )
         self.num_preemptions = 0
         self.num_preempted_prefix_tokens = 0
         self.num_resumed_preempted_reqs = 0
@@ -365,8 +371,12 @@ class Scheduler(SchedulerIOMixin):
         return next_token_int, finished
 
     def _can_allocate_batch(self, batch: Batch) -> bool:
-        margin = self.preempt_min_free_pages if self.enable_preemption and batch.is_decode else 0
         needed_pages = self.cache_manager.needed_pages_for_reqs(batch.reqs)
+        margin = (
+            self.preempt_min_free_pages
+            if self.enable_preemption and batch.is_decode and needed_pages > 0
+            else 0
+        )
         return needed_pages + margin <= self.cache_manager.allocatable_pages
 
     def _make_preempted_req(self, req: Req) -> Tuple[int, torch.Tensor, SamplingParams]:
@@ -375,7 +385,9 @@ class Scheduler(SchedulerIOMixin):
         sampling_params = replace(req.sampling_params, max_tokens=remaining_tokens)
         return req.uid, req.input_ids, sampling_params
 
-    def _preempt_now(self, victim: Req, preempted: List[Tuple[int, torch.Tensor, SamplingParams]]) -> None:
+    def _preempt_now(
+        self, victim: Req, preempted: List[Tuple[int, torch.Tensor, SamplingParams]]
+    ) -> None:
         removed = self.decode_manager.remove_uid(victim.uid)
         assert removed is victim, f"Decode victim {victim.uid} is not running"
         preempted.append(self._make_preempted_req(victim))
@@ -422,7 +434,6 @@ class Scheduler(SchedulerIOMixin):
             )
 
         preempted: List[Tuple[int, torch.Tensor, SamplingParams]] = []
-        margin = self.preempt_min_free_pages if self.enable_preemption and batch.is_decode else 0
         needed_pages_by_uid = {
             req.uid: self.cache_manager.needed_pages_for_reqs([req])
             for req in batch.reqs
@@ -430,6 +441,11 @@ class Scheduler(SchedulerIOMixin):
         needed_pages = sum(needed_pages_by_uid.values())
 
         def batch_fits() -> bool:
+            margin = (
+                self.preempt_min_free_pages
+                if self.enable_preemption and batch.is_decode and needed_pages > 0
+                else 0
+            )
             return needed_pages + margin <= self.cache_manager.allocatable_pages
 
         def is_candidate(req: Req) -> bool:
@@ -454,6 +470,14 @@ class Scheduler(SchedulerIOMixin):
                         (req.cached_len + self.cache_manager.page_size - 1)
                         // self.cache_manager.page_size,
                         req.uid,
+                    )
+                elif self.preemption_victim_policy == "smallest_kv":
+                    key = (
+                        -(
+                            (req.cached_len + self.cache_manager.page_size - 1)
+                            // self.cache_manager.page_size
+                        ),
+                        -req.uid,
                     )
                 elif self.preemption_victim_policy == "fcfs_tail":
                     key = req.uid
@@ -510,6 +534,16 @@ class Scheduler(SchedulerIOMixin):
                 self.num_preemptions,
             )
 
+    def _schedule_prefill_batch(self) -> Batch | None:
+        decode_reserve_pages = (
+            self.preempt_prefill_decode_reserve_pages if self.enable_preemption else 0
+        )
+        return self.prefill_manager.schedule_next_batch(
+            self.prefill_budget,
+            self.dynamic_kv_allocation,
+            decode_reserve_pages,
+        )
+
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs)
@@ -527,21 +561,12 @@ class Scheduler(SchedulerIOMixin):
         )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        if self.decode_first and self.pending_preempted_uids and self.prefill_manager.runnable:
-            batch = self.prefill_manager.schedule_next_batch(
-                self.prefill_budget, self.dynamic_kv_allocation
-            ) or self._schedule_decode_batch()
+        if self.enable_preemption:
+            batch = self._schedule_prefill_batch() or self._schedule_decode_batch()
         elif self.decode_first:
-            batch = (
-                self._schedule_decode_batch()
-                or self.prefill_manager.schedule_next_batch(
-                    self.prefill_budget, self.dynamic_kv_allocation
-                )
-            )
+            batch = self._schedule_decode_batch() or self._schedule_prefill_batch()
         else:
-            batch = self.prefill_manager.schedule_next_batch(
-                self.prefill_budget, self.dynamic_kv_allocation
-            ) or self._schedule_decode_batch()
+            batch = self._schedule_prefill_batch() or self._schedule_decode_batch()
         if batch is not None:
             batch = self._maybe_preempt_to_fit(batch)
         if batch is None:
@@ -570,9 +595,19 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_decode_batch(self) -> Batch | None:
         if self.enable_preemption:
+            page_budget = max(
+                self.cache_manager.allocatable_pages - self.preempt_min_free_pages, 0
+            )
             if self.enable_overlap_preemption:
-                return self.decode_manager.schedule_next_batch(self._cannot_schedule_uids())
-            return self.decode_manager.schedule_next_batch(self.protected_uids)
+                return self.decode_manager.schedule_next_batch(
+                    self._cannot_schedule_uids(),
+                    page_budget,
+                    self.preemption_victim_policy,
+                    self.protected_uids,
+                )
+            return self.decode_manager.schedule_next_batch(
+                self.protected_uids, page_budget, self.preemption_victim_policy
+            )
         return self.decode_manager.schedule_next_batch()
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:

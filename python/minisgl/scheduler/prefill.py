@@ -164,14 +164,20 @@ class PrefillManager:
         self.pending_list = pending_reqs + self.pending_list
 
     def schedule_next_batch(
-        self, prefill_budget: int, dynamic_kv_allocation: bool = False
+        self,
+        prefill_budget: int,
+        dynamic_kv_allocation: bool = False,
+        decode_reserve_pages: int = 0,
     ) -> Batch | None:
         assert self._rollback_batch is None, "Previous prefill batch was not committed"
+        if decode_reserve_pages < 0:
+            raise ValueError("decode_reserve_pages must be non-negative")
         if len(self.pending_list) == 0:
             return None
 
         # estimated offset due to in-flight decode
         reserved_size = 0 if dynamic_kv_allocation else self.decode_manager.inflight_tokens
+        reserved_size += decode_reserve_pages * self.cache_manager.page_size
         adder = PrefillAdder(
             token_budget=prefill_budget,
             reserved_size=reserved_size,

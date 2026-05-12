@@ -245,7 +245,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--preemption-victim-policy",
         type=str,
         default=ServerArgs.preemption_victim_policy,
-        choices=["largest_kv", "fcfs_tail"],
+        choices=["largest_kv", "smallest_kv", "fcfs_tail"],
         help="Victim selection policy for decode preemption.",
     )
 
@@ -256,6 +256,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help=(
             "Minimum extra allocatable pages to keep after fitting a decode batch when "
             "preemption is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--preempt-prefill-decode-reserve-pages",
+        type=int,
+        default=ServerArgs.preempt_prefill_decode_reserve_pages,
+        help=(
+            "KV pages kept available during prefill admission for future decode steps "
+            "when preemption is enabled."
         ),
     )
 
@@ -312,8 +321,6 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     del kwargs["tensor_parallel_size"]
 
     result = ServerArgs(**kwargs)
-    if result.enable_overlap_preemption and not result.enable_preemption:
-        raise ValueError("--enable-overlap-preemption requires --enable-preemption")
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell

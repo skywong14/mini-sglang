@@ -7,16 +7,6 @@ eval "$(conda shell.bash hook)"
 conda activate minisgl
 ```
 
-## Non-Overlap Smoke
-
-Runs one small-cache preemption workload with overlap scheduling disabled and
-prints the preemption counters and output lengths.
-
-```bash
-PYTHONPATH=python python tests/manual/preemption_smoke.py \
-  --model-path Qwen/Qwen3-0.6B
-```
-
 ## Overlap Greedy Correctness
 
 Compares:
@@ -54,23 +44,6 @@ PYTHONPATH=python python tests/manual/preemption_greedy_correctness.py \
 The `--require-deferred-preemption` variant should be used when validating the
 overlap-safe path specifically. The script defaults are tuned to exercise that
 path on `Qwen/Qwen3-0.6B`, and it fails unless `num_deferred_preemptions > 0`.
-
-## Overlap Smoke
-
-Runs one small-cache preemption workload and prints:
-
-- `num_preemptions`
-- `num_deferred_preemptions`
-- `num_preemption_stalls`
-- `num_prefill_fit_failures`
-- `num_resumed_preempted_reqs`
-- `output_lengths`
-
-```bash
-PYTHONPATH=python python tests/manual/preemption_smoke.py \
-  --model-path Qwen/Qwen3-0.6B \
-  --enable-overlap-preemption
-```
 
 ## Overlap Benchmark
 

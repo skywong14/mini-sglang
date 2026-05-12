@@ -128,6 +128,7 @@ def _make_scheduler(policy: str, allocatable_pages: int = 1, margin: int = 0):
     scheduler.enable_overlap_preemption = False
     scheduler.preemption_victim_policy = policy
     scheduler.preempt_min_free_pages = margin
+    scheduler.preempt_prefill_decode_reserve_pages = 0
     scheduler.num_preemptions = 0
     scheduler.num_preempted_prefix_tokens = 0
     scheduler.num_resumed_preempted_reqs = 0
@@ -195,6 +196,98 @@ def test_dynamic_prefill_estimate_ignores_output_len():
 
     assert dynamic._estimate_one(cached_len=0, input_len=2, output_len=1000) == 4
     assert legacy._estimate_one(cached_len=0, input_len=2, output_len=1000) == 1002
+
+
+def test_decode_manager_budgeted_batch_prioritizes_zero_page_reqs_then_budget():
+    manager = DecodeManager(page_size=4)
+    reqs = [
+        _make_decode_req(uid=1, cached_len=4),
+        _make_decode_req(uid=2, cached_len=5),
+        _make_decode_req(uid=3, cached_len=8),
+    ]
+    manager.filter_reqs(reqs)
+
+    batch = manager.schedule_next_batch(page_budget=1)
+
+    assert batch is not None
+    assert [req.uid for req in batch.reqs] == [2, 1]
+
+
+def test_decode_manager_budgeted_batch_returns_forced_preempt_candidate_when_none_fit():
+    manager = DecodeManager(page_size=4)
+    reqs = [_make_decode_req(uid=1, cached_len=4), _make_decode_req(uid=2, cached_len=8)]
+    manager.filter_reqs(reqs)
+
+    batch = manager.schedule_next_batch(page_budget=0)
+
+    assert batch is not None
+    assert [req.uid for req in batch.reqs] == [1]
+
+
+def test_decode_manager_forced_preempt_candidate_uses_victim_policy():
+    manager = DecodeManager(page_size=4)
+    reqs = [
+        _make_decode_req(uid=1, cached_len=4),
+        _make_decode_req(uid=2, cached_len=32),
+        _make_decode_req(uid=3, cached_len=8),
+    ]
+    manager.filter_reqs(reqs)
+
+    largest = manager.schedule_next_batch(page_budget=0, preemption_victim_policy="largest_kv")
+    smallest = manager.schedule_next_batch(page_budget=0, preemption_victim_policy="smallest_kv")
+    tail = manager.schedule_next_batch(page_budget=0, preemption_victim_policy="fcfs_tail")
+
+    assert largest is not None
+    assert smallest is not None
+    assert tail is not None
+    assert [req.uid for req in largest.reqs] == [2]
+    assert [req.uid for req in smallest.reqs] == [1]
+    assert [req.uid for req in tail.reqs] == [3]
+
+
+def test_decode_manager_forced_preempt_candidate_deprioritizes_protected_uids():
+    manager = DecodeManager(page_size=4)
+    reqs = [
+        _make_decode_req(uid=1, cached_len=4),
+        _make_decode_req(uid=2, cached_len=32),
+        _make_decode_req(uid=3, cached_len=8),
+    ]
+    manager.filter_reqs(reqs)
+
+    batch = manager.schedule_next_batch(
+        page_budget=0,
+        preemption_victim_policy="largest_kv",
+        forced_preempt_deprioritize_uids={2},
+    )
+
+    assert batch is not None
+    assert [req.uid for req in batch.reqs] == [3]
+
+
+def test_prefill_admission_reserves_decode_pages_in_dynamic_mode():
+    scheduler = _make_scheduler("largest_kv", allocatable_pages=2)
+    scheduler.cache_manager.admission_size = 8
+    sampling_params = SamplingParams(max_tokens=4)
+    scheduler.prefill_manager.add_preempted_req_front(
+        uid=2,
+        input_ids=torch.arange(2, dtype=torch.int32),
+        sampling_params=sampling_params,
+    )
+    scheduler.prefill_manager.add_preempted_req_front(
+        uid=1,
+        input_ids=torch.arange(2, dtype=torch.int32),
+        sampling_params=sampling_params,
+    )
+
+    batch = scheduler.prefill_manager.schedule_next_batch(
+        prefill_budget=8,
+        dynamic_kv_allocation=True,
+        decode_reserve_pages=1,
+    )
+
+    assert batch is not None
+    assert [req.uid for req in batch.reqs] == [1]
+    assert [pending.uid for pending in scheduler.prefill_manager.pending_list] == [2]
 
 
 def test_prefill_no_fit_returns_none_and_counts_failure(monkeypatch):
@@ -375,6 +468,23 @@ def test_preemption_fcfs_tail_policy_uses_largest_uid():
     assert new_batch is not None
     assert [req.uid for req in new_batch.reqs] == [1, 2]
     assert scheduler.last_preempted_uids == [3]
+
+
+def test_preemption_smallest_kv_policy_minimizes_recompute_victim():
+    scheduler = _make_scheduler("smallest_kv", allocatable_pages=2)
+    reqs = [
+        _make_decode_req(uid=1, cached_len=32),
+        _make_decode_req(uid=2, cached_len=4),
+        _make_decode_req(uid=3, cached_len=8),
+    ]
+    scheduler.decode_manager.filter_reqs(reqs)
+    batch = Batch(reqs=list(reqs), phase="decode")
+
+    new_batch = scheduler._maybe_preempt_to_fit(batch)
+
+    assert new_batch is not None
+    assert [req.uid for req in new_batch.reqs] == [1, 3]
+    assert scheduler.last_preempted_uids == [2]
 
 
 def test_preemption_margin_can_force_additional_victims():
@@ -818,7 +928,12 @@ def test_decode_scheduling_excludes_protected_uids_when_preemption_is_enabled():
     runnable = _make_decode_req(uid=2, cached_len=4)
 
     class EmptyPrefillManager:
-        def schedule_next_batch(self, prefill_budget, dynamic_kv_allocation=False):
+        def schedule_next_batch(
+            self,
+            prefill_budget,
+            dynamic_kv_allocation=False,
+            decode_reserve_pages=0,
+        ):
             return None
 
     scheduler = _make_scheduler("largest_kv", allocatable_pages=4)
@@ -834,6 +949,17 @@ def test_decode_scheduling_excludes_protected_uids_when_preemption_is_enabled():
 
     assert scheduled is not None
     assert [req.uid for req in scheduled.reqs] == [2]
+
+
+def test_preemption_decode_scheduling_uses_allocatable_budget_after_margin():
+    reqs = [_make_decode_req(uid=1, cached_len=4), _make_decode_req(uid=2, cached_len=8)]
+    scheduler = _make_scheduler("largest_kv", allocatable_pages=2, margin=1)
+    scheduler.decode_manager.filter_reqs(reqs)
+
+    scheduled = scheduler._schedule_decode_batch()
+
+    assert scheduled is not None
+    assert [req.uid for req in scheduled.reqs] == [1]
 
 
 def test_overlap_preemption_keeps_protected_normal_request_schedulable():
@@ -934,8 +1060,14 @@ def test_decode_first_resumes_preempted_request_before_more_decode():
         def __init__(self):
             self.calls = 0
 
-        def schedule_next_batch(self, prefill_budget, dynamic_kv_allocation=False):
+        def schedule_next_batch(
+            self,
+            prefill_budget,
+            dynamic_kv_allocation=False,
+            decode_reserve_pages=0,
+        ):
             self.calls += 1
+            assert decode_reserve_pages == 0
             return prefill_batch
 
         def commit_batch(self, batch):
@@ -954,6 +1086,7 @@ def test_decode_first_resumes_preempted_request_before_more_decode():
     scheduler.decode_first = True
     scheduler.dynamic_kv_allocation = True
     scheduler.prefill_budget = 123
+    scheduler.preempt_prefill_decode_reserve_pages = 0
     scheduler.pending_preempted_uids = {1}
     scheduler.protected_uids = set()
     scheduler.deferred_preempt_uids = set()
@@ -972,6 +1105,60 @@ def test_decode_first_resumes_preempted_request_before_more_decode():
     assert scheduler.decode_manager.calls == 0
     assert scheduler.last_schedule_action.resumed_uids == (1,)
     assert scheduler.last_schedule_action.batch_uids == (1,)
+
+
+def test_preemption_admits_new_prefill_before_decode_when_no_preempted_resume():
+    prefill_batch = Batch(reqs=[_make_decode_req(uid=1, cached_len=4)], phase="prefill")
+    decode_batch = Batch(reqs=[_make_decode_req(uid=2, cached_len=4)], phase="decode")
+
+    class RecordingPrefillManager:
+        runnable = True
+
+        def __init__(self):
+            self.calls = []
+
+        def schedule_next_batch(
+            self,
+            prefill_budget,
+            dynamic_kv_allocation=False,
+            decode_reserve_pages=0,
+        ):
+            self.calls.append((prefill_budget, dynamic_kv_allocation, decode_reserve_pages))
+            return prefill_batch
+
+        def commit_batch(self, batch):
+            pass
+
+    class RecordingDecodeManager:
+        def __init__(self):
+            self.calls = 0
+
+        def schedule_next_batch(self, exclude_uids=None, page_budget=None):
+            self.calls += 1
+            return decode_batch
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.enable_preemption = True
+    scheduler.decode_first = True
+    scheduler.dynamic_kv_allocation = True
+    scheduler.prefill_budget = 123
+    scheduler.preempt_prefill_decode_reserve_pages = 7
+    scheduler.pending_preempted_uids = set()
+    scheduler.protected_uids = set()
+    scheduler.deferred_preempt_uids = set()
+    scheduler.last_preempted_uids = []
+    scheduler.schedule_step_id = 0
+    scheduler.last_schedule_action = None
+    scheduler.prefill_manager = RecordingPrefillManager()
+    scheduler.decode_manager = RecordingDecodeManager()
+    scheduler._maybe_preempt_to_fit = lambda batch: batch
+    scheduler._prepare_batch = lambda batch: batch
+
+    scheduled = scheduler._schedule_next_batch()
+
+    assert scheduled is prefill_batch
+    assert scheduler.prefill_manager.calls == [(123, True, 7)]
+    assert scheduler.decode_manager.calls == 0
 
 
 def _make_run_forever_scheduler():
@@ -1051,8 +1238,13 @@ def test_no_preemption_mode_keeps_prefill_first_scheduling():
         def __init__(self):
             self.calls = []
 
-        def schedule_next_batch(self, prefill_budget, dynamic_kv_allocation=False):
-            self.calls.append((prefill_budget, dynamic_kv_allocation))
+        def schedule_next_batch(
+            self,
+            prefill_budget,
+            dynamic_kv_allocation=False,
+            decode_reserve_pages=0,
+        ):
+            self.calls.append((prefill_budget, dynamic_kv_allocation, decode_reserve_pages))
             return prefill_batch
 
         def commit_batch(self, batch):
@@ -1084,7 +1276,7 @@ def test_no_preemption_mode_keeps_prefill_first_scheduling():
     scheduled = scheduler._schedule_next_batch()
 
     assert scheduled is prefill_batch
-    assert scheduler.prefill_manager.calls == [(123, False)]
+    assert scheduler.prefill_manager.calls == [(123, False, 0)]
     assert scheduler.decode_manager.calls == 0
 
 
@@ -1095,8 +1287,13 @@ def test_no_preemption_mode_uses_decode_when_prefill_is_empty():
         def __init__(self):
             self.calls = []
 
-        def schedule_next_batch(self, prefill_budget, dynamic_kv_allocation=False):
-            self.calls.append((prefill_budget, dynamic_kv_allocation))
+        def schedule_next_batch(
+            self,
+            prefill_budget,
+            dynamic_kv_allocation=False,
+            decode_reserve_pages=0,
+        ):
+            self.calls.append((prefill_budget, dynamic_kv_allocation, decode_reserve_pages))
             return None
 
     class RecordingDecodeManager:
@@ -1125,7 +1322,7 @@ def test_no_preemption_mode_uses_decode_when_prefill_is_empty():
     scheduled = scheduler._schedule_next_batch()
 
     assert scheduled is decode_batch
-    assert scheduler.prefill_manager.calls == [(123, False)]
+    assert scheduler.prefill_manager.calls == [(123, False, 0)]
     assert scheduler.decode_manager.calls == 1
 
 
@@ -1141,9 +1338,11 @@ def test_server_args_parse_preemption_flags():
             "--dynamic-kv-allocation",
             "--decode-first",
             "--preemption-victim-policy",
-            "fcfs_tail",
+            "smallest_kv",
             "--preempt-min-free-pages",
             "3",
+            "--preempt-prefill-decode-reserve-pages",
+            "256",
         ]
     )
 
@@ -1151,12 +1350,13 @@ def test_server_args_parse_preemption_flags():
     assert args.enable_overlap_preemption
     assert args.dynamic_kv_allocation
     assert args.decode_first
-    assert args.preemption_victim_policy == "fcfs_tail"
+    assert args.preemption_victim_policy == "smallest_kv"
     assert args.preempt_min_free_pages == 3
+    assert args.preempt_prefill_decode_reserve_pages == 256
 
 
 def test_server_args_reject_overlap_preemption_without_preemption():
-    with pytest.raises(ValueError, match="requires --enable-preemption"):
+    with pytest.raises(ValueError, match="requires"):
         parse_args(
             [
                 "--model-path",
@@ -1164,5 +1364,19 @@ def test_server_args_reject_overlap_preemption_without_preemption():
                 "--dtype",
                 "float16",
                 "--enable-overlap-preemption",
+            ]
+        )
+
+
+def test_server_args_reject_preempt_reserve_without_preemption():
+    with pytest.raises(ValueError, match="requires enable_preemption"):
+        parse_args(
+            [
+                "--model-path",
+                "dummy-model",
+                "--dtype",
+                "float16",
+                "--preempt-prefill-decode-reserve-pages",
+                "1",
             ]
         )
