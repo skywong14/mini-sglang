@@ -7,6 +7,12 @@ eval "$(conda shell.bash hook)"
 conda activate minisgl
 ```
 
+## Scheduling Policy
+
+`enable_preemption` uses prefill-first scheduling in the current implementation.
+`--decode-first` is not the active scheduling policy when `enable_preemption=True`;
+this is intentional for now.
+
 ## Overlap Greedy Correctness
 
 Compares:

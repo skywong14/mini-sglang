@@ -215,8 +215,9 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--enable-preemption",
         action="store_true",
         help=(
-            "Enable recompute-based decode preemption. This also enables dynamic KV "
-            "allocation and decode-first scheduling."
+            "Enable dynamic KV allocation and recompute-based decode preemption. "
+            "Current preemption scheduling policy is prefill-first followed by "
+            "page-budgeted decode."
         ),
     )
 

@@ -82,7 +82,7 @@ class Scheduler(SchedulerIOMixin):
         self.enable_preemption = config.enable_preemption
         self.enable_overlap_preemption = config.enable_overlap_preemption
         self.dynamic_kv_allocation = config.dynamic_kv_allocation or config.enable_preemption
-        self.decode_first = config.decode_first or config.enable_preemption
+        self.decode_first = config.decode_first
         self.preemption_victim_policy = config.preemption_victim_policy
         self.preempt_min_free_pages = config.preempt_min_free_pages
         self.preempt_prefill_decode_reserve_pages = (
@@ -562,6 +562,11 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         if self.enable_preemption:
+            # Preemption mode currently schedules prefill first. This prioritizes
+            # resumed/preempted requests and prefill admission; decode pressure is
+            # controlled by page-budgeted decode batching, preempt_min_free_pages,
+            # and preempt_prefill_decode_reserve_pages. This is distinct from the
+            # standalone decode_first mode used when enable_preemption=False.
             batch = self._schedule_prefill_batch() or self._schedule_decode_batch()
         elif self.decode_first:
             batch = self._schedule_decode_batch() or self._schedule_prefill_batch()

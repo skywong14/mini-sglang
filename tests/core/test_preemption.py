@@ -8,8 +8,10 @@ import pytest
 import torch
 import minisgl.scheduler.scheduler as scheduler_module
 from minisgl.core import Batch, Req, SamplingParams
+from minisgl.distributed import DistributedInfo
 from minisgl.kvcache import BaseCacheHandle
 from minisgl.message import AbortBackendMsg
+from minisgl.scheduler.config import SchedulerConfig
 from minisgl.scheduler.decode import DecodeManager
 from minisgl.scheduler.prefill import ChunkedReq, PrefillAdder, PrefillManager
 from minisgl.scheduler.scheduler import ForwardInput, Scheduler
@@ -150,6 +152,47 @@ def _make_scheduler(policy: str, allocatable_pages: int = 1, margin: int = 0):
     scheduler.send_result = lambda reply: scheduler.sent_replies.append(reply)
     scheduler.eos_token_id = 999
     return scheduler
+
+
+def test_scheduler_init_preemption_does_not_force_decode_first(monkeypatch):
+    import minisgl.engine as engine_module
+
+    class FakeEngine:
+        def __init__(self, config):
+            self.device = torch.device("cpu")
+            self.stream = object()
+            self.page_table = torch.zeros((config.max_running_req + 1, 16), dtype=torch.int32)
+            self.num_pages = 16
+            self.tp_cpu_group = object()
+
+    @contextmanager
+    def dummy_stream_context(stream):
+        yield
+
+    monkeypatch.setattr(engine_module, "Engine", FakeEngine)
+    monkeypatch.setattr(scheduler_module.torch.cuda, "Stream", lambda device=None: object())
+    monkeypatch.setattr(scheduler_module.torch.cuda, "stream", dummy_stream_context)
+    monkeypatch.setattr(scheduler_module.torch.cuda, "set_stream", lambda stream: None)
+    monkeypatch.setattr(
+        scheduler_module, "load_tokenizer", lambda model_path: SimpleNamespace(eos_token_id=0)
+    )
+
+    config = SchedulerConfig(
+        model_path="dummy-model",
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.float16,
+        max_running_req=2,
+        cache_type="naive",
+        offline_mode=True,
+        enable_preemption=True,
+        decode_first=False,
+        num_page_override=16,
+    )
+
+    scheduler = Scheduler(config)
+
+    assert scheduler.enable_preemption
+    assert scheduler.decode_first is False
 
 
 class FakeEvent:
@@ -937,7 +980,7 @@ def test_decode_scheduling_excludes_protected_uids_when_preemption_is_enabled():
             return None
 
     scheduler = _make_scheduler("largest_kv", allocatable_pages=4)
-    scheduler.decode_first = True
+    scheduler.decode_first = False
     scheduler.dynamic_kv_allocation = True
     scheduler.prefill_budget = 123
     scheduler.prefill_manager = EmptyPrefillManager()
@@ -1050,7 +1093,7 @@ def test_schedule_action_uses_step_id_and_immutable_uid_tuples():
     assert scheduler.last_schedule_action.batch_uids == ()
 
 
-def test_decode_first_resumes_preempted_request_before_more_decode():
+def test_preemption_resumes_preempted_request_before_more_decode():
     prefill_batch = Batch(reqs=[_make_decode_req(uid=1, cached_len=4)], phase="prefill")
     decode_batch = Batch(reqs=[_make_decode_req(uid=2, cached_len=4)], phase="decode")
 
@@ -1083,7 +1126,7 @@ def test_decode_first_resumes_preempted_request_before_more_decode():
 
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.enable_preemption = True
-    scheduler.decode_first = True
+    scheduler.decode_first = False
     scheduler.dynamic_kv_allocation = True
     scheduler.prefill_budget = 123
     scheduler.preempt_prefill_decode_reserve_pages = 0
@@ -1139,7 +1182,7 @@ def test_preemption_admits_new_prefill_before_decode_when_no_preempted_resume():
 
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.enable_preemption = True
-    scheduler.decode_first = True
+    scheduler.decode_first = False
     scheduler.dynamic_kv_allocation = True
     scheduler.prefill_budget = 123
     scheduler.preempt_prefill_decode_reserve_pages = 7
